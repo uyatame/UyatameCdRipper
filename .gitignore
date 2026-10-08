@@ -1,0 +1,17 @@
+# ビルド成果物
+build/
+app/build/
+.gradle/
+*.apk
+*.aab
+
+# 端末ごとの設定(公開しない)
+local.properties
+keystore.properties
+*.jks
+*.keystore
+
+# エディタ
+.idea/
+*.iml
+.DS_Store
