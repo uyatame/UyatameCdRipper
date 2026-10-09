@@ -29,6 +29,15 @@ interface DsdSink {
 /** ネイティブ DSD(USB DAC 直接出力のみ) */
 internal class NativeDsdSink(private val fmt: DacFormat, private val channels: Int, private val swap: Boolean) : DsdSink {
     private val session = UsbDac.begin()
+
+    init {
+        AudioEngine.setOutput(
+            com.uyatame.cdripper.player.OutputDevice(
+                com.uyatame.cdripper.player.OutputDevices.KEY_USB_DIRECT, com.uyatame.cdripper.player.OutputKind.UsbDirect,
+                UsbDac.deviceName() ?: "USB DAC", com.uyatame.cdripper.T("USB DAC · ネイティブ DSD", "USB DAC · Native DSD"), UsbDac.maxSpec(),
+            ),
+        )
+    }
     override val sampleRate: Int = fmt.rate
     override val bytesPerFrame: Double = fmt.subslot.toDouble()
     override var framesWritten = 0L

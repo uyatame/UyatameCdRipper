@@ -76,6 +76,8 @@ data class AppSettings(
     val usbVolume: Int = -1,
     val dsdMode: Int = 0,
     val dsdSwap: Boolean = false,
+    /** 出力先(空なら自動。"種類|アドレス") */
+    val outputDevice: String = "",
     val eqEnabled: Boolean = false,
     val eqPreset: Int = 0,
     val eqGains: String = "",
@@ -83,6 +85,10 @@ data class AppSettings(
     val eqAutoPreamp: Boolean = true,
     val libraryList: Boolean = false,
     val verboseLog: Boolean = false,
+    /** ライブラリのトップに並べるカテゴリーの順番(カンマ区切り。先頭の "-" は非表示) */
+    val libTiles: String = "",
+    /** ギャップレス再生 */
+    val gapless: Boolean = true,
 )
 
 /** 出力方式: 0 = 通常, 2 = ビットパーフェクト(USB DAC 直接出力)。以前の版の bitPerfect もこちらに移す */
@@ -137,6 +143,7 @@ object Keys {
     val usbVolume = intPreferencesKey("usbVolume")
     val dsdMode = intPreferencesKey("dsdMode")
     val dsdSwap = booleanPreferencesKey("dsdSwap")
+    val outputDevice = stringPreferencesKey("outputDevice")
     val eqEnabled = booleanPreferencesKey("eqEnabled")
     val eqPreset = intPreferencesKey("eqPreset")
     val eqGains = stringPreferencesKey("eqGains")
@@ -144,6 +151,8 @@ object Keys {
     val eqAutoPreamp = booleanPreferencesKey("eqAutoPreamp")
     val libraryList = booleanPreferencesKey("libraryList")
     val verboseLog = booleanPreferencesKey("verboseLog")
+    val libTiles = stringPreferencesKey("libTiles")
+    val gapless = booleanPreferencesKey("gapless")
 }
 
 class SettingsRepository(private val context: Context) {
@@ -182,6 +191,7 @@ class SettingsRepository(private val context: Context) {
             usbVolume = p[Keys.usbVolume] ?: d.usbVolume,
             dsdMode = p[Keys.dsdMode] ?: d.dsdMode,
             dsdSwap = p[Keys.dsdSwap] ?: d.dsdSwap,
+            outputDevice = p[Keys.outputDevice] ?: d.outputDevice,
             eqEnabled = p[Keys.eqEnabled] ?: d.eqEnabled,
             eqPreset = p[Keys.eqPreset] ?: d.eqPreset,
             eqGains = p[Keys.eqGains] ?: d.eqGains,
@@ -189,11 +199,22 @@ class SettingsRepository(private val context: Context) {
             eqAutoPreamp = p[Keys.eqAutoPreamp] ?: d.eqAutoPreamp,
             libraryList = p[Keys.libraryList] ?: d.libraryList,
             verboseLog = p[Keys.verboseLog] ?: d.verboseLog,
+            libTiles = p[Keys.libTiles] ?: d.libTiles,
+            gapless = p[Keys.gapless] ?: d.gapless,
         )
     }
 
     suspend fun <T> set(key: Preferences.Key<T>, value: T) {
         context.dataStore.edit { it[key] = value }
+    }
+
+    /** 出力先をまとめて切り替える(途中の状態で出力が作り直されないよう、1 回で書き込む) */
+    suspend fun setOutput(usbDirect: Boolean, device: String?) {
+        context.dataStore.edit {
+            it[Keys.usbDirect] = usbDirect
+            if (!usbDirect) it[Keys.bitPerfect] = false
+            if (device != null) it[Keys.outputDevice] = device
+        }
     }
 
     suspend fun resetDrive() {

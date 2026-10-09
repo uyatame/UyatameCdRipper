@@ -100,6 +100,54 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val settings = repo.flow.stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
     val player = PlayerController(app, viewModelScope)
     private val library = Library(app)
+    /** お気に入り・プレイリスト・再生履歴 */
+    val store = com.uyatame.cdripper.data.PlayerStore(app)
+
+    /**
+     * ライブラリの画面の行き先(空ならトップ)。
+     * "cat:albums" などのカテゴリー、"album:キー"、"artist:名前"、"genre:名前"、"year:年"、"playlist:ID"、"search"
+     */
+    val libStack = androidx.compose.runtime.mutableStateListOf<String>()
+
+    fun libPush(route: String) {
+        if (libStack.lastOrNull() != route) libStack.add(route)
+    }
+
+    fun libPop() {
+        if (libStack.isNotEmpty()) libStack.removeAt(libStack.lastIndex)
+    }
+
+    fun libReplaceTop(route: String) {
+        if (libStack.isEmpty()) libStack.add(route) else libStack[libStack.lastIndex] = route
+    }
+
+    fun libHome() = libStack.clear()
+
+    /** 再生画面などからライブラリの画面を開くとき、ライブラリのタブへ切り替えるための合図 */
+    var libNavEvent by mutableIntStateOf(0)
+        private set
+
+    fun openRoute(route: String) {
+        libPush(route)
+        libNavEvent++
+    }
+
+    // ---- どの画面からでも開くメニュー ----
+    /** 曲の操作メニュー */
+    var menuTrack by mutableStateOf<com.uyatame.cdripper.library.LibTrack?>(null)
+    /** プレイリストの中の曲のメニューのとき(プレイリスト ID, 位置) */
+    var menuTrackPlaylist by mutableStateOf<Pair<String, Int>?>(null)
+    /** アルバムの操作メニュー */
+    var menuAlbum by mutableStateOf<LibAlbum?>(null)
+    /** プレイリストに追加する曲(選ぶ画面を出す) */
+    var playlistPick by mutableStateOf<List<String>?>(null)
+    /** 曲の詳細情報を出す曲 */
+    var infoItem by mutableStateOf<PlayItem?>(null)
+
+    fun showTrackMenu(t: com.uyatame.cdripper.library.LibTrack, playlist: Pair<String, Int>? = null) {
+        menuTrackPlaylist = playlist
+        menuTrack = t
+    }
 
     // ---- ドライブ / ディスク ----
     var status by mutableStateOf(T("ドライブ未接続", "No drive connected"))
@@ -172,6 +220,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ---- ライブラリ ----
     var albums by mutableStateOf<List<LibAlbum>>(emptyList())
         private set
+
+    private class LibIndex(val tracks: Map<String, com.uyatame.cdripper.library.LibTrack>, val albumOf: Map<String, String>)
+    private var indexFor: List<LibAlbum>? = null
+    private var indexCache = LibIndex(emptyMap(), emptyMap())
+
+    private fun libIndex(): LibIndex {
+        val a = albums
+        if (a !== indexFor) {
+            val t = HashMap<String, com.uyatame.cdripper.library.LibTrack>()
+            val k = HashMap<String, String>()
+            for (al in a) for (tr in al.tracks) { t[tr.uri] = tr; k[tr.uri] = al.key }
+            indexCache = LibIndex(t, k)
+            indexFor = a
+        }
+        return indexCache
+    }
+
+    /** URI から曲を引く */
+    val trackMap: Map<String, com.uyatame.cdripper.library.LibTrack> get() = libIndex().tracks
+
+    /** 曲の URI から、その曲のアルバムのキーを引く */
+    fun albumKeyOf(uri: String?): String? = uri?.let { libIndex().albumOf[it] }
+
+    fun albumByKey(key: String?): LibAlbum? = key?.let { k -> albums.firstOrNull { it.key == k } }
     var libScanning by mutableStateOf(false)
         private set
     /** すべての曲を読み直しているか(false なら新しい曲だけ) */
@@ -219,6 +291,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     init {
+        com.uyatame.cdripper.library.StorageAccess.init(app)
         ContextCompat.registerReceiver(app, permReceiver, IntentFilter(permAction), ContextCompat.RECEIVER_NOT_EXPORTED)
         ContextCompat.registerReceiver(
             app, detachReceiver, IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED), ContextCompat.RECEIVER_NOT_EXPORTED,
@@ -237,12 +310,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 val mode = s.outputMode
                 com.uyatame.cdripper.player.AudioEngine.setOutputMode(mode)
+                // ビットパーフェクト再生がオンなら、USB DAC の使用許可を先にもらっておく
+                if (mode == 2 && lastMode != 2) com.uyatame.cdripper.player.usb.UsbDac.requestPermissionIfNeeded()
                 player.setUsbVolume(s.usbVolume)
+                player.gapless = s.gapless
                 val dsdChanged = com.uyatame.cdripper.player.AudioEngine.dsdMode != s.dsdMode ||
                     com.uyatame.cdripper.player.AudioEngine.dsdSwap != s.dsdSwap
                 com.uyatame.cdripper.player.AudioEngine.dsdMode = s.dsdMode
                 com.uyatame.cdripper.player.AudioEngine.dsdSwap = s.dsdSwap
-                if (lastMode != null && (lastMode != mode || (dsdChanged && player.isDsd))) player.reloadOutput()
+                val devChanged = com.uyatame.cdripper.player.AudioEngine.preferredKey != s.outputDevice
+                com.uyatame.cdripper.player.AudioEngine.preferredKey = s.outputDevice
+                if (lastMode != null && (lastMode != mode || (dsdChanged && player.isDsd) || (devChanged && mode != 2))) player.reloadOutput()
                 lastMode = mode
             }
         }
@@ -251,15 +329,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         player.onStateChanged = {
             updateService()
             loadPlayerArt()
+            recordHistory()
+            saveResume()
         }
         viewModelScope.launch {
+            store.load()
             albums = Library.group(withContext(Dispatchers.IO) { library.loadCache() })
+            restoreQueue()
             val s = repo.flow.first()
-            if (s.outputUri != null || s.libraryFolders.isNotEmpty()) refreshLibrary(base = s)
+            if (s.outputUri != null || s.libraryFolders.isNotEmpty()) {
+                // 以前の版の一覧には音質・ジャンルが無いので、一度だけ全曲を読み直す
+                refreshLibrary(fresh = library.needsFullRescan, base = s)
+            }
+        }
+        // 再生中は、位置をときどき保存しておく(アプリが閉じられても続きから再生できるように)
+        viewModelScope.launch {
+            while (true) {
+                delay(15_000)
+                if (player.isPlaying) saveResume()
+            }
         }
     }
 
     override fun onCleared() {
+        // 終了処理で再生リストが空になる前に、続きを保存しておく
+        saveJob?.cancel()
+        writeResume()
+        resumeReady = false
+        player.onStateChanged = null
         com.uyatame.cdripper.player.AudioEngine.logger = null
         com.uyatame.cdripper.player.AudioEngine.onUsbVolume = null
         runCatching { ctx.unregisterReceiver(permReceiver) }
@@ -286,13 +383,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** ビットパーフェクト(USB DAC 直接出力)の切り替え */
     fun setOutputMode(mode: Int) {
+        viewModelScope.launch { repo.setOutput(mode == 2, null) }
+    }
+
+    /** 出力先を選ぶ(独自ドライバーの USB DAC ならビットパーフェクト再生をオンにする) */
+    fun setOutputDevice(key: String) {
         viewModelScope.launch {
-            if (mode == 2) {
-                repo.set(com.uyatame.cdripper.data.Keys.usbDirect, true)
-            } else {
-                repo.set(com.uyatame.cdripper.data.Keys.bitPerfect, false)
-                repo.set(com.uyatame.cdripper.data.Keys.usbDirect, false)
-            }
+            if (key == com.uyatame.cdripper.player.OutputDevices.KEY_USB_DIRECT) repo.setOutput(true, null)
+            else repo.setOutput(false, key)
         }
     }
 
@@ -329,7 +427,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
                 )
             }
-            cur != null -> NotifInfo(
+            cur != null && player.started -> NotifInfo(
                 true, cur.title, cur.artist + if (cur.album.isNotEmpty()) " ・ " + cur.album else "",
                 playing = player.isPlaying,
                 type = if (player.isCd) {
@@ -360,6 +458,72 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 player.setArt(bmp)
                 updateService()
             }
+        }
+    }
+
+    // ================= 再生履歴・前回の続き =================
+
+    private var lastRecordedId = -1L
+    /** 前回の続きを読み込み終えるまでは、保存しない(読み込む前に消してしまわないように) */
+    private var resumeReady = false
+
+    private fun recordHistory() {
+        val cur = player.current ?: return
+        if (!player.isPlaying || cur.id == lastRecordedId) return
+        lastRecordedId = cur.id
+        cur.uri?.toString()?.let { store.recordPlay(it) }
+    }
+
+    private var saveJob: Job? = null
+
+    /** 続きの保存(並べ替えなどで続けて呼ばれるので、少し待ってまとめて書く) */
+    private fun saveResume() {
+        if (!resumeReady) return
+        saveJob?.cancel()
+        saveJob = viewModelScope.launch {
+            delay(400)
+            writeResume()
+        }
+    }
+
+    private fun writeResume() {
+        if (!resumeReady) return
+        val q = player.queue
+        when {
+            q.isEmpty() -> store.saveResume(null)
+            // CD の曲は次回には読めないので、続きとしては残さない
+            q.any { it.uri == null } -> store.saveResume(null)
+            else -> store.saveResume(
+                com.uyatame.cdripper.data.ResumeState(
+                    q.map { it.uri.toString() }, player.index, player.positionMs, player.shuffle, player.repeatMode,
+                    player.originalOrder.mapNotNull { it.uri?.toString() },
+                ),
+            )
+        }
+    }
+
+    private suspend fun restoreQueue() {
+        try {
+            val r = store.loadResume() ?: return
+            if (player.current != null) return
+            val map = trackMap
+            val items = ArrayList<PlayItem>()
+            var idx = 0
+            r.uris.forEachIndexed { i, u ->
+                val t = map[u] ?: return@forEachIndexed
+                if (i == r.index) idx = items.size
+                items.add(itemOf(t))
+            }
+            if (items.isEmpty()) return
+            // シャッフル前の並びは、同じ項目(同じ id)を並べ替えて作る
+            val pool = HashMap<String, ArrayDeque<PlayItem>>()
+            items.forEach { pool.getOrPut(it.uri.toString()) { ArrayDeque() }.addLast(it) }
+            val orig = r.original.mapNotNull { u -> pool[u]?.removeFirstOrNull() }
+            val origList = if (orig.size == items.size) orig else items
+            val sameTrack = map.containsKey(r.uris.getOrNull(r.index))
+            player.restore(items, idx, if (sameTrack) r.positionMs else 0L, r.shuffle, r.repeat, origList)
+        } finally {
+            resumeReady = true
         }
     }
 
@@ -1100,11 +1264,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             libNew = 0
             try {
                 val old = if (fresh) emptyList() else albums.flatMap { it.tracks }
+                val light = player.isPlaying
                 val list = withContext(Dispatchers.IO) {
                     val all = ArrayList<com.uyatame.cdripper.library.LibTrack>()
                     for (t in trees) {
                         runCatching {
-                            all.addAll(library.scan(Uri.parse(t), old) { i, n -> libProgress = "$i / $n"; libNew = n })
+                            all.addAll(library.scan(Uri.parse(t), old, light) { i, n -> libProgress = "$i / $n"; libNew = n })
                         }.onFailure { log(T("フォルダを読めません: ${folderLabel(t)}", "Cannot read folder: ${folderLabel(t)}")) }
                     }
                     all.distinctBy { it.uri }.also { library.saveCache(it) }
@@ -1278,11 +1443,85 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ================= 再生 =================
 
-    fun playAlbum(a: LibAlbum, start: Int, shuffle: Boolean = false) {
-        val items = a.tracks.map {
-            PlayItem(it.title, it.artist, it.album, it.durationMs, Uri.parse(it.uri), null, a.key, it.uri, it.coverUri)
+    /** ライブラリの曲を、再生用の項目にする */
+    fun itemOf(t: com.uyatame.cdripper.library.LibTrack): PlayItem =
+        PlayItem(
+            t.title, t.artist, t.album, t.durationMs, Uri.parse(t.uri), null,
+            albumKeyOf(t.uri) ?: t.uri, t.uri, t.coverUri, t.folderId,
+        )
+
+    fun playAlbum(a: LibAlbum, start: Int, shuffle: Boolean = false) = playTracks(a.tracks, start, shuffle)
+
+    /** 曲の一覧を再生する(shuffle なら順番を混ぜる) */
+    fun playTracks(list: List<com.uyatame.cdripper.library.LibTrack>, start: Int, shuffle: Boolean = false) {
+        if (list.isEmpty()) return
+        val items = list.map { itemOf(it) }
+        if (shuffle) {
+            if (!player.shuffle) player.toggleShuffle()
+            player.playFiles(items, (0 until items.size).random())
+        } else {
+            player.playFiles(items, start)
         }
-        if (shuffle) player.playFiles(items.shuffled(), 0) else player.playFiles(items, start)
+    }
+
+    /** ライブラリ全体をシャッフル再生 */
+    fun shuffleAll() = playTracks(albums.flatMap { it.tracks }, 0, shuffle = true)
+
+    fun playNext(list: List<com.uyatame.cdripper.library.LibTrack>) {
+        if (list.isEmpty()) return
+        val wasEmpty = player.current == null
+        player.playNext(list.map { itemOf(it) })
+        if (!wasEmpty) snack = T("次に再生します(${list.size}曲)", "Playing next (${list.size} songs)")
+    }
+
+    fun addToQueue(list: List<com.uyatame.cdripper.library.LibTrack>) {
+        if (list.isEmpty()) return
+        val wasEmpty = player.current == null
+        player.addToQueue(list.map { itemOf(it) })
+        if (!wasEmpty) snack = T("再生リストの最後に追加しました(${list.size}曲)", "Added to the end of the queue (${list.size} songs)")
+    }
+
+    // ---- お気に入り・プレイリスト ----
+
+    fun toggleFav(uri: String) {
+        val on = !store.isFav(uri)
+        store.toggleFav(uri)
+        snack = if (on) T("お気に入りに追加しました", "Added to favorites") else T("お気に入りから外しました", "Removed from favorites")
+    }
+
+    fun setFav(list: List<com.uyatame.cdripper.library.LibTrack>, on: Boolean) {
+        store.setFav(list.map { it.uri }, on)
+        snack = if (on) T("${list.size}曲をお気に入りに追加しました", "Added ${list.size} songs to favorites")
+        else T("お気に入りから外しました", "Removed from favorites")
+    }
+
+    fun toggleFavAlbum(key: String) {
+        val on = !store.isFavAlbum(key)
+        store.toggleFavAlbum(key)
+        snack = if (on) T("アルバムをお気に入りに追加しました", "Album added to favorites") else T("お気に入りから外しました", "Removed from favorites")
+    }
+
+    fun addToPlaylist(id: String, uris: List<String>) {
+        if (uris.isEmpty()) return
+        store.addToPlaylist(id, uris)
+        val name = store.playlists.firstOrNull { it.id == id }?.name.orEmpty()
+        snack = T("「$name」に${uris.size}曲を追加しました", "Added ${uris.size} songs to \"$name\"")
+    }
+
+    fun createPlaylist(name: String, uris: List<String>) {
+        store.createPlaylist(name, uris)
+        snack = T("プレイリスト「${name.trim()}」を作りました", "Created playlist \"${name.trim()}\"")
+    }
+
+    /** 今の再生リストをプレイリストとして保存する(CD の曲は除く) */
+    fun saveQueueAsPlaylist(name: String) {
+        createPlaylist(name, player.queue.mapNotNull { it.uri?.toString() })
+    }
+
+    /** プレイリストの曲(ライブラリに見つからない曲は除く) */
+    fun playlistTracks(p: com.uyatame.cdripper.data.Playlist): List<com.uyatame.cdripper.library.LibTrack> {
+        val map = trackMap
+        return p.uris.mapNotNull { map[it] }
     }
 
     fun playCd(t: TocTrack? = null) {

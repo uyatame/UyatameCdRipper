@@ -85,6 +85,13 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.animation.core.Animatable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import kotlinx.coroutines.launch
 import androidx.compose.ui.unit.dp
 import com.uyatame.cdripper.data.AppSettings
 import com.uyatame.cdripper.data.QUALITY_PRESETS
@@ -120,8 +127,16 @@ fun App(vm: MainViewModel) {
         }
         var tab by rememberSaveable { mutableIntStateOf(0) }
         var settingsPage by rememberSaveable { mutableIntStateOf(0) }
-        var albumKey by rememberSaveable { mutableStateOf<String?>(null) }
         var showPlayer by rememberSaveable { mutableStateOf(false) }
+        // 再生画面やメニューから「アルバムを表示」などを選んだら、ライブラリのタブへ
+        var seenNav by remember { mutableIntStateOf(vm.libNavEvent) }
+        LaunchedEffect(vm.libNavEvent) {
+            if (vm.libNavEvent != seenNav) {
+                seenNav = vm.libNavEvent
+                tab = 0
+                showPlayer = false
+            }
+        }
         val snackHost = remember { SnackbarHostState() }
 
         // 新しい音楽CDを読み込んだら、ディスク画面を自動で開く
@@ -129,7 +144,7 @@ fun App(vm: MainViewModel) {
         LaunchedEffect(vm.discEvent) {
             if (vm.discEvent != seenDisc) {
                 seenDisc = vm.discEvent
-                if (s.autoOpenDisc) { tab = 1; albumKey = null }
+                if (s.autoOpenDisc) tab = 1
             }
         }
         LaunchedEffect(vm.actionSnack) {
@@ -140,8 +155,9 @@ fun App(vm: MainViewModel) {
                 when (a) {
                     is ActionSnack.OpenAlbum -> {
                         tab = 0
-                        albumKey = vm.albums.firstOrNull { it.title == a.album && (it.artist == a.artist || it.tracks.any { t -> t.artist == a.artist }) }?.key
+                        val key = vm.albums.firstOrNull { it.title == a.album && (it.artist == a.artist || it.tracks.any { t -> t.artist == a.artist }) }?.key
                             ?: vm.albums.firstOrNull { it.title == a.album }?.key
+                        if (key != null) vm.libPush("album:$key")
                     }
                     is ActionSnack.UndoMeta -> vm.undoMeta()
                 }
@@ -155,7 +171,6 @@ fun App(vm: MainViewModel) {
             }
         }
         BackHandler(enabled = tab == 2 && settingsPage != 0) { settingsPage = 0 }
-        BackHandler(enabled = tab == 0 && albumKey != null) { albumKey = null }
 
         Box(Modifier.fillMaxSize()) {
         Scaffold(
@@ -165,7 +180,8 @@ fun App(vm: MainViewModel) {
                     if (vm.busy) RipBar(vm) { tab = 1 }
                     if (vm.player.current != null) MiniPlayer(vm) { showPlayer = true }
                     NavigationBar {
-                        NavigationBarItem(tab == 0, { tab = 0 }, { Icon(AppIcons.Library, null) }, label = { Text(T("ライブラリ", "Library")) })
+                        // ライブラリを表示中にもう一度押すと、ライブラリのトップへ戻る
+                        NavigationBarItem(tab == 0, { if (tab == 0) vm.libHome() else tab = 0 }, { Icon(AppIcons.Library, null) }, label = { Text(T("ライブラリ", "Library")) })
                         NavigationBarItem(tab == 1, { tab = 1 }, { Icon(AppIcons.Album, null) }, label = { Text(T("ディスク", "Disc")) })
                         NavigationBarItem(tab == 2, { tab = 2 }, { Icon(Icons.Filled.Settings, null) }, label = { Text(T("設定", "Settings")) })
                     }
@@ -174,7 +190,7 @@ fun App(vm: MainViewModel) {
         ) { pad ->
             Box(Modifier.padding(pad).fillMaxSize()) {
                 when (tab) {
-                    0 -> LibraryScreen(vm, s, albumKey) { albumKey = it }
+                    0 -> LibraryScreen(vm, s)
                     1 -> CdScreen(vm, s) { tab = 2; settingsPage = 0 }
                     else -> SettingsScreen(vm, s, settingsPage) { settingsPage = it }
                 }
@@ -188,6 +204,7 @@ fun App(vm: MainViewModel) {
             NowPlayingScreen(vm, s) { showPlayer = false }
         }
         }
+        GlobalSheets(vm)
     }
 }
 
@@ -416,22 +433,53 @@ fun RipBar(vm: MainViewModel, onOpen: () -> Unit) {
 fun MiniPlayer(vm: MainViewModel, onOpen: () -> Unit) {
     val p = vm.player
     val cur = p.current ?: return
+    val scope = rememberCoroutineScope()
+    val shift = remember { Animatable(0f) }
+    val density = LocalDensity.current
+    val limit = with(density) { 72.dp.toPx() }
     Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen)) {
         Column {
             LinearProgressIndicator(
                 progress = { if (p.durationMs > 0) (p.positionMs.toFloat() / p.durationMs).coerceIn(0f, 1f) else 0f },
                 modifier = Modifier.fillMaxWidth().height(2.dp),
             )
-            Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                PlayArt(vm, cur, Modifier.size(44.dp), 6.dp)
-                Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(cur.title, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(
-                        (if (p.isCd) T("CD ・ ", "CD · ") else "") + cur.artist,
-                        style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+            Row(
+                Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)
+                    // 左右にスワイプすると、前後の曲へ
+                    .pointerInput(Unit) {
+                        detectHorizontalDragGestures(
+                            onDragEnd = {
+                                val v = shift.value
+                                scope.launch {
+                                    if (v <= -limit) vm.player.next() else if (v >= limit) vm.player.prev()
+                                    shift.animateTo(0f)
+                                }
+                            },
+                            onDragCancel = { scope.launch { shift.animateTo(0f) } },
+                        ) { change, d ->
+                            change.consume()
+                            scope.launch { shift.snapTo((shift.value + d).coerceIn(-limit * 2, limit * 2)) }
+                        }
+                    },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    Modifier.weight(1f).graphicsLayer {
+                        translationX = shift.value
+                        alpha = 1f - (kotlin.math.abs(shift.value) / (limit * 2.5f)).coerceIn(0f, 0.7f)
+                    },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    PlayArt(vm, cur, Modifier.size(44.dp), 6.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(cur.title, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            (if (p.isCd) T("CD ・ ", "CD · ") else "") + cur.artist,
+                            style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
                 IconButton({ p.toggle() }) {
                     Icon(if (p.isPlaying) AppIcons.Pause else Icons.Filled.PlayArrow, if (p.isPlaying) T("一時停止", "Pause") else T("再生", "Play"))

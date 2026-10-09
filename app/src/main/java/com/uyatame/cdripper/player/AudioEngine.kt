@@ -92,6 +92,17 @@ object AudioEngine {
     /** ネイティブ DSD のバイト順を逆にする(DAC によって必要) */
     @Volatile var dsdSwap = false
 
+    /** 選ばれている出力先(OutputDevices の key。空なら自動) */
+    @Volatile var preferredKey = ""
+
+    /** 画面表示用: 今の出力先 */
+    var output by mutableStateOf<OutputDevice?>(null)
+        private set
+
+    internal fun setOutput(d: OutputDevice?) {
+        main.post { output = d }
+    }
+
     /** 音量キーなどで DAC の音量が変わったときに呼ばれる(設定に保存するため) */
     @Volatile var onUsbVolume: ((Int) -> Unit)? = null
 
@@ -132,6 +143,7 @@ object AudioEngine {
     fun release(am: AudioManager, attrs: AudioAttributes) {
         closeUsb()
         report(false, "")
+        setOutput(null)
     }
 
     /** 今の出力方式で使わないものだけを手放す */
@@ -249,8 +261,9 @@ class AudioOutput(
     private var bbuf = ByteArray(0)
     private val frameTmp = IntArray(8)
     private var warned = -1
+    private var routing: android.media.AudioRouting.OnRoutingChangedListener? = null
     /** 書き込んだフレーム数(再生の終わりを判定する) */
-    var framesWritten = 0L
+    @Volatile var framesWritten = 0L
         private set
 
     init {
@@ -280,6 +293,12 @@ class AudioOutput(
             }
             AudioEngine.report(perfect, title + " · ${khz(sampleRate)}" + (if (up != null) " → ${khz(d.rate)}" else "") + " / ${d.bits} bit")
             AudioEngine.log("output: usb direct ${khz(d.rate)} ${d.channels}ch ${d.bits}bit" + (if (up != null) " (x$upFactor)" else ""))
+            AudioEngine.setOutput(
+                OutputDevice(
+                    OutputDevices.KEY_USB_DIRECT, OutputKind.UsbDirect, usbDac.deviceName() ?: "USB DAC",
+                    T("USB DAC · ビットパーフェクト", "USB DAC · Bit-perfect"), usbDac.maxSpec(),
+                ),
+            )
         } else {
             dac = null
             dacSession = -1
@@ -294,6 +313,15 @@ class AudioOutput(
             val enc = AFormat.ENCODING_PCM_FLOAT
             // 2) 通常の出力
             val t = build(AFormat.Builder().setSampleRate(sampleRate).setChannelMask(stereo).setEncoding(enc).build(), enc)
+            // 選ばれている出力先があれば、そこへ出す
+            OutputDevices.find(ctx, AudioEngine.preferredKey)?.let { dev -> runCatching { t.setPreferredDevice(dev) } }
+            // 実際に音が出ている先を画面に出す
+            val rl = android.media.AudioRouting.OnRoutingChangedListener { r ->
+                if (!released) r.routedDevice?.let { AudioEngine.setOutput(OutputDevices.describe(it)) }
+            }
+            routing = rl
+            runCatching { t.addOnRoutingChangedListener(rl, android.os.Handler(android.os.Looper.getMainLooper())) }
+            AudioEngine.setOutput(OutputDevices.find(ctx, AudioEngine.preferredKey)?.let { OutputDevices.describe(it) } ?: OutputDevices.defaultDevice(ctx))
             track = t
             outEnc = enc
             bitPerfect = false
@@ -319,11 +347,11 @@ class AudioOutput(
         val min = AudioTrack.getMinBufferSize(sampleRate, f.channelMask.takeIf { it != 0 } ?: AFormat.CHANNEL_OUT_STEREO, enc)
             .coerceAtLeast(4096)
         val bytesPerFrame = channels * pcmBytes(enc).coerceAtLeast(2)
-        // 約 0.5 秒分のバッファ(高いサンプリング周波数でも途切れないように)
+        // 約 1.5 秒分のバッファ(ほかの処理で読み込みが遅れても途切れないように)
         return AudioTrack.Builder()
             .setAudioAttributes(attrs)
             .setAudioFormat(f)
-            .setBufferSizeInBytes(max(min * 2, sampleRate * bytesPerFrame / 2))
+            .setBufferSizeInBytes(max(min * 2, sampleRate * bytesPerFrame * 3 / 2))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
     }
@@ -345,6 +373,7 @@ class AudioOutput(
             return
         }
         val t = track ?: return
+        routing?.let { l -> runCatching { t.removeOnRoutingChangedListener(l) } }
         runCatching { t.pause() }
         runCatching { t.flush() }
         runCatching { t.release() }
@@ -357,8 +386,18 @@ class AudioOutput(
             if (!usbDac.streaming) return framesWritten
             return usbDac.played(dacSession) / upFactor
         }
-        return runCatching { (track?.playbackHeadPosition ?: 0).toLong() and 0xFFFFFFFFL }.getOrDefault(0L)
+        // 再生位置は 32bit で一周する(ギャップレスで長くつなぐと届く)ので、一周した分を足す
+        synchronized(this) {
+            val raw = runCatching { (track?.playbackHeadPosition ?: 0).toLong() and 0xFFFFFFFFL }
+                .getOrElse { return wrapHi + lastRaw }
+            if (raw < lastRaw && lastRaw - raw > 0x80000000L) wrapHi += 0x100000000L
+            lastRaw = raw
+            return wrapHi + raw
+        }
     }
+
+    private var lastRaw = 0L
+    private var wrapHi = 0L
 
     /** 1 サンプルを 32bit 整数(上位詰め)で読む */
     private fun readI32(src: ByteBuffer, enc: Int): Int = when (enc) {
@@ -485,6 +524,22 @@ class AudioOutput(
             val w = t.write(fbuf, off, samples - off, AudioTrack.WRITE_BLOCKING)
             if (w < 0) return
             if (w == 0) Thread.sleep(20) else off += w
+        }
+        checkUnderrun(t)
+    }
+
+    private var lastUnderrun = 0
+    private var underrunCheckAt = 0L
+
+    /** 音の途切れ(バッファが空になった回数)を、増えたときだけログに出す */
+    private fun checkUnderrun(t: AudioTrack) {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now < underrunCheckAt) return
+        underrunCheckAt = now + 2000
+        val u = runCatching { t.underrunCount }.getOrDefault(0)
+        if (u > lastUnderrun) {
+            AudioEngine.log("underrun: +${u - lastUnderrun} (total $u)")
+            lastUnderrun = u
         }
     }
 

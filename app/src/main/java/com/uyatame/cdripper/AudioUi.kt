@@ -251,3 +251,104 @@ fun AudioSettingsSheet(vm: MainViewModel, s: AppSettings, onDismiss: () -> Unit)
         }
     }
 }
+
+/** 出力先の種類ごとのアイコン */
+fun outputIcon(k: com.uyatame.cdripper.player.OutputKind): androidx.compose.ui.graphics.vector.ImageVector = when (k) {
+    com.uyatame.cdripper.player.OutputKind.Speaker -> AppIcons.Smartphone
+    com.uyatame.cdripper.player.OutputKind.Wired -> AppIcons.Headphones
+    com.uyatame.cdripper.player.OutputKind.Usb, com.uyatame.cdripper.player.OutputKind.UsbDirect -> AppIcons.Usb
+    com.uyatame.cdripper.player.OutputKind.Bluetooth -> AppIcons.Bluetooth
+    else -> AppIcons.Speaker
+}
+
+/** 出力先を選ぶシート(プレイヤー画面の出力先の表示から開く) */
+@Composable
+fun OutputDeviceSheet(vm: MainViewModel, s: AppSettings, onDismiss: () -> Unit) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    var devices by remember { mutableStateOf(com.uyatame.cdripper.player.OutputDevices.list(ctx)) }
+    var auto by remember { mutableStateOf(com.uyatame.cdripper.player.OutputDevices.defaultDevice(ctx)) }
+    // イヤホンの抜き差しなどで一覧を更新する
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        val am = ctx.getSystemService(android.media.AudioManager::class.java)
+        val cb = object : android.media.AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(added: Array<out android.media.AudioDeviceInfo>?) {
+                devices = com.uyatame.cdripper.player.OutputDevices.list(ctx)
+                auto = com.uyatame.cdripper.player.OutputDevices.defaultDevice(ctx)
+            }
+            override fun onAudioDevicesRemoved(removed: Array<out android.media.AudioDeviceInfo>?) {
+                devices = com.uyatame.cdripper.player.OutputDevices.list(ctx)
+                auto = com.uyatame.cdripper.player.OutputDevices.defaultDevice(ctx)
+            }
+        }
+        am.registerAudioDeviceCallback(cb, android.os.Handler(android.os.Looper.getMainLooper()))
+        onDispose { am.unregisterAudioDeviceCallback(cb) }
+    }
+    val selectedKey = if (s.outputMode == 2) com.uyatame.cdripper.player.OutputDevices.KEY_USB_DIRECT else s.outputDevice
+    val current = AudioEngine.output
+        ?: devices.firstOrNull { it.key == selectedKey }
+        ?: auto
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).navigationBarsPadding()
+                .padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (current != null) {
+                Text(T("使用中の出力先", "Current output"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                androidx.compose.material3.Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.Icon(outputIcon(current.kind), null, Modifier.padding(end = 16.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(current.name, style = MaterialTheme.typography.titleMedium)
+                            if (current.detail.isNotEmpty()) Text(current.detail, style = MaterialTheme.typography.bodySmall)
+                            if (current.spec.isNotEmpty()) Text(current.spec, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+            Text(
+                T("出力先を選んでください", "Choose an output"), style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            @Composable
+            fun item(key: String, kind: com.uyatame.cdripper.player.OutputKind, title: String, sub: String) {
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .clickable { vm.setOutputDevice(key); onDismiss() }.padding(vertical = 10.dp, horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    androidx.compose.material3.Icon(outputIcon(kind), null, Modifier.padding(end = 16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(title, style = MaterialTheme.typography.bodyLarge)
+                        if (sub.isNotEmpty()) {
+                            Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    if (key == selectedKey) {
+                        Text("✓", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+            item(
+                com.uyatame.cdripper.player.OutputDevices.KEY_AUTO, com.uyatame.cdripper.player.OutputKind.Auto,
+                T("自動", "Automatic"),
+                T("Android に任せる", "Let Android decide") + (auto?.let { " · ${it.name}" } ?: ""),
+            )
+            devices.forEach { d ->
+                item(d.key, d.kind, d.name, listOf(d.detail, d.spec).filter { it.isNotEmpty() }.joinToString(" · "))
+            }
+            Text(
+                T(
+                    "USB DAC を選ぶとビットパーフェクト再生になります(アプリが DAC を直接動かします)",
+                    "Choosing the USB DAC turns on bit-perfect playback (the app drives the DAC directly)",
+                ),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+        }
+    }
+}

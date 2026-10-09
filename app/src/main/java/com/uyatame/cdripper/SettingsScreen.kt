@@ -32,6 +32,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -85,9 +86,8 @@ fun SettingsScreen(vm: MainViewModel, s: AppSettings, page: Int, onPage: (Int) -
 
 fun folderLabel(uri: String?): String {
     if (uri == null) return T("未設定", "Not set")
-    val seg = Uri.parse(uri).lastPathSegment ?: return T("設定済み", "Set")
-    val path = seg.substringAfter(':', "")
-    return if (path.isEmpty()) T("内部ストレージ(ルート)", "Internal storage (root)") else T("内部ストレージ / $path", "Internal storage / $path")
+    // SDカードなど、保存場所ごとの名前を出す
+    return com.uyatame.cdripper.library.StorageAccess.label(uri)
 }
 
 /** 各設定ページの共通の枠(見出し・戻るボタン・スクロール) */
@@ -344,6 +344,44 @@ private fun LibraryFoldersPage(vm: MainViewModel, s: AppSettings) {
             )
         }
     }
+    AllFilesSection(vm)
+}
+
+/** 「すべてのファイルへのアクセス」の許可(任意) */
+@Composable
+private fun AllFilesSection(vm: MainViewModel) {
+    val ctx = LocalContext.current
+    var granted by remember { mutableStateOf(com.uyatame.cdripper.library.StorageAccess.allFiles) }
+    // 設定画面から戻ってきたときに反映する
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(1000)
+            val now = com.uyatame.cdripper.library.StorageAccess.allFiles
+            if (now != granted) {
+                granted = now
+                if (now) vm.refreshLibrary(fresh = true)
+            }
+        }
+    }
+    Section(T("すべてのファイルへのアクセス", "All files access")) {
+        Text(
+            T(
+                "許可すると、ライブラリのフォルダや曲情報をファイルから直接読むので、読み込みが速くなります。許可しなくても、これまでどおり使えます。",
+                "When allowed, folders and track info are read directly from files, so the library loads faster. The app works without it.",
+            ),
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            if (granted) T("許可されています", "Allowed") else T("許可されていません", "Not allowed"),
+            style = MaterialTheme.typography.bodyLarge,
+            color = if (granted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        FilledTonalButton({
+            val sa = com.uyatame.cdripper.library.StorageAccess
+            runCatching { ctx.startActivity(sa.requestIntent(ctx)) }
+                .onFailure { runCatching { ctx.startActivity(sa.fallbackIntent()) } }
+        }) { Text(if (granted) T("設定を開く(取り消す)", "Open settings (revoke)") else T("許可する", "Allow")) }
+    }
 }
 
 @Composable
@@ -354,7 +392,12 @@ private fun DisplayPage(vm: MainViewModel, s: AppSettings) {
     }
     BitPerfectPanel(vm, s)
     EqualizerPanel(vm, s)
-    Section(T("再生画面", "Player")) {
+    Section(T("再生", "Playback")) {
+        SwitchRow(
+            T("ギャップレス再生", "Gapless playback"),
+            T("同じ形式の曲が続くとき、曲間に無音をはさまずにつなぎます(ライブ盤やクラシックで切れ目が出ません)", "Joins songs of the same format without a pause between them"),
+            s.gapless,
+        ) { vm.set(Keys.gapless, it) }
         SwitchRow(
             T("アンビエントモード", "Ambient mode"),
             T("再生画面の背景を、ジャケット画像の色合いにします", "Tints the player background with the album art"),

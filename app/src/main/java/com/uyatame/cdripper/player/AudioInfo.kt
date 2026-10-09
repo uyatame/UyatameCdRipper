@@ -7,13 +7,33 @@ import android.provider.OpenableColumns
 
 /** 再生中の曲の形式・音質(例: FLAC 44.1 kHz / 16 bit ・ 905 kbps) */
 object AudioInfo {
-    fun describe(ctx: Context, item: PlayItem): String? {
-        if (item.cdTrack != null) return "CD-DA 44.1 kHz / 16 bit · 1411 kbps"
+    /**
+     * 曲の形式の詳細。text は画面に出す 1 行の説明。
+     * hiRes は「CD を超える音質」(48 kHz を超える、または 16 bit を超えるロスレス、または DSD)。
+     */
+    class Detail(
+        val codec: String,
+        val rate: Int,
+        val bits: Int,
+        val kbps: Long,
+        val hiRes: Boolean,
+        val text: String,
+        val sizeBytes: Long,
+    )
+
+    fun describe(ctx: Context, item: PlayItem): String? = detail(ctx, item)?.text
+
+    fun detail(ctx: Context, item: PlayItem): Detail? {
+        if (item.cdTrack != null) return Detail("CD-DA", 44100, 16, 1411, false, "CD-DA 44.1 kHz / 16 bit · 1411 kbps", 0L)
         val uri = item.uri ?: return null
         if (com.uyatame.cdripper.player.dsd.DsdFile.isDsd(Uri.decode(uri.toString()))) {
-            val d = com.uyatame.cdripper.player.dsd.DsdTags.read(ctx, uri)?.info ?: return "DSD"
+            val d = com.uyatame.cdripper.player.dsd.DsdTags.read(ctx, uri)?.info
+                ?: return Detail("DSD", 0, 1, 0, true, "DSD", size(ctx, uri) ?: 0L)
             val kbps = d.rate.toLong() * d.channels / 1000
-            return d.label() + " · " + (if (d.dff) "DFF" else "DSF") + " · $kbps kbps"
+            return Detail(
+                "DSD", d.rate, 1, kbps, true,
+                d.label() + " · " + (if (d.dff) "DFF" else "DSF") + " · $kbps kbps", size(ctx, uri) ?: 0L,
+            )
         }
         val r = MediaMetadataRetriever()
         try {
@@ -24,22 +44,26 @@ object AudioInfo {
             var kbps = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull()?.let { it / 1000 }
             val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
             val ext = Uri.decode(uri.toString()).substringAfterLast('.', "").lowercase()
-            val name = formatName(mime, ext)
+            var name = formatName(mime, ext)
+            if (name == "AAC" && (bits ?: 0) in 16..32) name = "ALAC"
             if (name == "FLAC" || name == "WAV") {
                 header(ctx, uri, name)?.let { (sr, bps) ->
                     if (rate == null || rate <= 0) rate = sr
                     if (bits == null || bits <= 0) bits = bps
                 }
             }
+            val bytes = size(ctx, uri)
             if ((kbps == null || kbps <= 0) && dur > 0) {
-                size(ctx, uri)?.let { kbps = it * 8 / dur }
+                bytes?.let { kbps = it * 8 / dur }
             }
             val lossless = name == "FLAC" || name == "WAV" || name == "ALAC"
             val sb = StringBuilder(name)
             rate?.takeIf { it > 0 }?.let { sb.append(' ').append(khz(it)) }
             if (lossless) bits?.takeIf { it > 0 }?.let { sb.append(" / ").append(it).append(" bit") }
             kbps?.takeIf { it > 0 }?.let { sb.append(" · ").append(it).append(" kbps") }
-            return sb.toString()
+            val rr = rate ?: 0
+            val bb = if (lossless) bits ?: 0 else 0
+            return Detail(name, rr, bb, kbps ?: 0L, lossless && (rr > 48000 || bb > 16), sb.toString(), bytes ?: 0L)
         } catch (e: Exception) {
             return null
         } finally {

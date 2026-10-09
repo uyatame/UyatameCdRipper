@@ -105,7 +105,13 @@ object UsbDac {
                         }
                     }
                     UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                        if (dev != null && isDac(dev)) main.postDelayed({ onChanged?.invoke() }, 500)
+                        if (dev != null && isDac(dev)) {
+                            // 挿し直したら、改めて許可を求められるようにする
+                            asked.remove(dev.deviceName)
+                            // ビットパーフェクト再生がオンなら、再生を始める前に許可をもらっておく
+                            if (AudioEngine.wantUsbDirect) requestPermissionIfNeeded()
+                            main.postDelayed({ onChanged?.invoke() }, 500)
+                        }
                     }
                 }
             }
@@ -119,6 +125,23 @@ object UsbDac {
     }
 
     private fun usb(): UsbManager = app.getSystemService(UsbManager::class.java)
+
+    /**
+     * USB DAC がつながっていて、まだ使用の許可が無ければ許可を求める。
+     * 再生を始める前に許可を済ませておくことで、再生開始時に止まったり切り替わったりしないようにする。
+     */
+    fun requestPermissionIfNeeded() {
+        if (!inited) return
+        val dev = findDac() ?: return
+        if (usb().hasPermission(dev)) return
+        if (!asked.add(dev.deviceName)) return
+        val pi = PendingIntent.getBroadcast(
+            app, 7, Intent(ACTION_PERMISSION).setPackage(app.packageName),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        main.post { runCatching { usb().requestPermission(dev, pi) } }
+        AudioEngine.log("usb dac: requesting permission for ${dev.productName}")
+    }
 
     /** USB オーディオの再生用インターフェースを持つ機器か */
     private fun isDac(d: UsbDevice): Boolean {
@@ -135,6 +158,22 @@ object UsbDac {
         }
         return false
     }
+
+    /** 対応している最大の形式(「最大 32bit / 768kHz」。DAC を開いたことがなければ空) */
+    fun maxSpec(): String {
+        val inf = info ?: return lastSpec
+        val bits = inf.alts.filter { !it.raw }.maxOfOrNull { it.bits } ?: 0
+        val rate = rates.maxOrNull() ?: 0
+        if (rate <= 0) return lastSpec
+        val dsd = inf.alts.any { it.raw }
+        lastSpec = T("最大 ", "Up to ") + (if (bits > 0) "${bits}bit / " else "") +
+            com.uyatame.cdripper.player.OutputDevices.khz(rate) + (if (dsd) " · DSD" else "")
+        return lastSpec
+    }
+    @Volatile private var lastSpec = ""
+
+    /** 使用中の DAC の名前 */
+    fun deviceName(): String? = device?.productName?.trim()?.ifEmpty { null }
 
     fun findDac(): UsbDevice? = runCatching { usb().deviceList.values.firstOrNull { isDac(it) } }.getOrNull()
 

@@ -19,6 +19,9 @@ class Id3Data(
     val picture: ByteArray? = null,
     /** 書き換えのときに残す画像フレーム(APIC の中身) */
     val rawApic: List<ByteArray> = emptyList(),
+    val genre: String? = null,
+    /** 歌詞(USLT) */
+    val lyrics: String? = null,
 )
 
 /** DSF / DSDIFF に入っている ID3v2 タグを読む(Android 標準の機能では読めないため) */
@@ -85,6 +88,26 @@ object Id3Reader {
         return s.split('\u0000').firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
     }
 
+    /** USLT(歌詞)の本文: 文字コード(1) 言語(3) 説明(終端まで) 歌詞 */
+    private fun lyricsOf(body: ByteArray): String? {
+        if (body.size < 5) return null
+        val enc = body[0].toInt()
+        var p = 4
+        if (enc == 1 || enc == 2) {
+            while (p + 1 < body.size && !(body[p].toInt() == 0 && body[p + 1].toInt() == 0)) p += 2
+            p += 2
+        } else {
+            while (p < body.size && body[p].toInt() != 0) p++
+            p++
+        }
+        if (p >= body.size) return null
+        // 文字コードの 1 バイトを付け直して、通常のテキストとして読む
+        val b = ByteArray(1 + body.size - p)
+        b[0] = body[0]
+        System.arraycopy(body, p, b, 1, body.size - p)
+        return text(b)
+    }
+
     private fun num(s: String?): Pair<Int?, Int?> {
         if (s == null) return null to null
         val a = s.substringBefore('/').trim().toIntOrNull()
@@ -130,6 +153,8 @@ object Id3Reader {
         var albumArtist: String? = null; var year: String? = null
         var trk: String? = null; var pos: String? = null
         var pic: ByteArray? = null
+        var genre: String? = null
+        var lyrics: String? = null
         val apics = ArrayList<ByteArray>()
         while (p + hdr <= b.size) {
             if (b[p].toInt() == 0) break
@@ -161,6 +186,8 @@ object Id3Reader {
                 "TYER", "TYE", "TDRC" -> if (year == null) year = text(body)?.take(4)
                 "TRCK", "TRK" -> trk = text(body)
                 "TPOS", "TPA" -> pos = text(body)
+                "TCON", "TCO" -> if (genre == null) genre = text(body)
+                "USLT", "ULT" -> if (lyrics == null) lyrics = lyricsOf(body)
                 "APIC", "PIC" -> {
                     if (pic == null) pic = picture(body, v22)
                     if (!v22) apics.add(body)
@@ -170,6 +197,6 @@ object Id3Reader {
         }
         val (t, tt) = num(trk)
         val (d, dt) = num(pos)
-        return Id3Data(title, artist, album, albumArtist, year, t, tt, d, dt, pic, apics)
+        return Id3Data(title, artist, album, albumArtist, year, t, tt, d, dt, pic, apics, genre = genre, lyrics = lyrics)
     }
 }

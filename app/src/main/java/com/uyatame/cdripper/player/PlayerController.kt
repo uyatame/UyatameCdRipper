@@ -41,7 +41,16 @@ data class PlayItem(
     val artKey: String? = null,
     val artTrackUri: String? = null,
     val artCoverUri: String? = null,
-)
+    /** 曲が入っているフォルダ(歌詞ファイルを探すのに使う) */
+    val folderId: String? = null,
+    /** 再生リストの中で 1 曲ずつ区別するための番号(同じ曲を 2 回入れても別物として扱う) */
+    val id: Long = PlayItem.nextId(),
+) {
+    companion object {
+        private val counter = java.util.concurrent.atomic.AtomicLong()
+        fun nextId(): Long = counter.incrementAndGet()
+    }
+}
 
 /**
  * ファイル(OS内蔵デコーダで PCM に変換)と CD(READ CD で読んだ PCM)の両方を、
@@ -64,6 +73,15 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
     var shuffle by mutableStateOf(false)
         private set
     private var original: List<PlayItem> = emptyList()
+    /** このアプリを開いてから一度でも再生したか(前回の続きを読み込んだだけでは通知を出さない) */
+    var started by mutableStateOf(false)
+        private set
+    /** スリープタイマーの終了時刻(SystemClock.elapsedRealtime。0 ならオフ) */
+    var sleepAtMs by mutableLongStateOf(0L)
+        private set
+    /** 今の曲が終わったら止める */
+    var stopAfterTrack by mutableStateOf(false)
+        private set
 
     /** ロック画面・通知・Bluetooth機器からの操作用 */
     val session = MediaSession(ctx, "UCRT").apply {
@@ -165,11 +183,21 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
         UsbDac.onActiveChanged = { a -> setVolumeRouting(a) }
         scope.launch {
             while (true) {
-                delay(400)
+                delay(250)
                 val c = cd
                 val f = file
-                if (c != null) positionMs = c.positionMs()
-                else if (f != null) positionMs = f.positionMs()
+                if (c != null) {
+                    applySwitches(c, c.seg, c.head())
+                    if (cd === c) positionMs = c.positionMs()
+                } else if (f != null) {
+                    f.seg?.let { applySwitches(f, it, f.head()) }
+                    if (file === f) positionMs = f.positionMs()
+                }
+                val sl = sleepAtMs
+                if (sl > 0 && android.os.SystemClock.elapsedRealtime() >= sl) {
+                    sleepAtMs = 0L
+                    pause()
+                }
             }
         }
     }
@@ -194,12 +222,213 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
         }
     }
 
+    /** 前回の再生状態を読み込む(再生はしない。再生ボタンで続きから始まる) */
+    fun restore(items: List<PlayItem>, start: Int, posMs: Long, shuffleOn: Boolean, repeat: Int, originalOrder: List<PlayItem> = items) {
+        if (items.isEmpty() || current != null) return
+        halt()
+        drive = null
+        queue = items
+        original = if (shuffleOn) originalOrder else items
+        shuffle = shuffleOn
+        repeatMode = repeat.coerceIn(0, 2)
+        index = start.coerceIn(0, items.lastIndex)
+        val d = items[index].durationMs
+        durationMs = d
+        positionMs = if (d > 0) posMs.coerceIn(0L, d) else posMs.coerceAtLeast(0L)
+        isPlaying = false
+        changed()
+    }
+
+    /** 今の曲の次に入れる */
+    fun playNext(items: List<PlayItem>) {
+        if (items.isEmpty()) return
+        syncSwitches()
+        val cur = current
+        if (cur == null) { playFiles(items, 0); return }
+        queue = queue.toMutableList().apply { addAll(index + 1, items) }
+        original = if (shuffle) {
+            val o = original.toMutableList()
+            val ci = o.indexOfFirst { it.id == cur.id }.let { if (it < 0) o.lastIndex else it }
+            o.addAll(ci + 1, items)
+            o
+        } else queue
+        changed()
+        rejoinIfStale()
+    }
+
+    /** 再生リストの最後に入れる */
+    fun addToQueue(items: List<PlayItem>) {
+        if (items.isEmpty()) return
+        if (current == null) { playFiles(items, 0); return }
+        syncSwitches()
+        queue = queue + items
+        original = if (shuffle) original + items else queue
+        changed()
+        rejoinIfStale()
+    }
+
+    /** 再生リストから 1 曲外す */
+    fun removeAt(i: Int) {
+        if (i !in queue.indices) return
+        if (queue.size == 1) { stop(); return }
+        syncSwitches()
+        val gone = queue[i]
+        val q = queue.toMutableList().apply { removeAt(i) }
+        original = if (shuffle) original.filter { it.id != gone.id } else q
+        when {
+            i < index -> { queue = q; index-- }
+            i > index -> queue = q
+            else -> {
+                // 再生中の曲を外したら、次の曲へ(最後の曲なら 1 つ前へ)
+                val play = isPlaying
+                queue = q
+                index = index.coerceAtMost(q.lastIndex)
+                startCurrent(0, play)
+                return
+            }
+        }
+        changed()
+        rejoinIfStale()
+    }
+
+    /** 再生リストの並べ替え */
+    fun move(from: Int, to: Int) {
+        if (from !in queue.indices || to !in queue.indices || from == to) return
+        syncSwitches()
+        val cur = current
+        val q = queue.toMutableList()
+        q.add(to, q.removeAt(from))
+        queue = q
+        if (cur != null) index = q.indexOfFirst { it.id == cur.id }.coerceAtLeast(0)
+        if (!shuffle) original = q
+        changed()
+        rejoinIfStale()
+    }
+
+    /** 再生リストの i 番目から再生する */
+    fun jumpTo(i: Int) {
+        if (i !in queue.indices) return
+        index = i
+        startCurrent(0, true)
+    }
+
+    /** 今の曲より後ろをすべて外す */
+    fun clearUpcoming() {
+        syncSwitches()
+        if (index < 0 || index >= queue.lastIndex) return
+        val keep = queue.subList(0, index + 1).toList()
+        val dropped = queue.subList(index + 1, queue.size).map { it.id }.toHashSet()
+        queue = keep
+        original = if (shuffle) original.filter { it.id !in dropped } else keep
+        changed()
+        rejoinIfStale()
+    }
+
+    // ---------------- ギャップレス再生 ----------------
+
+    /** ギャップレス再生(同じ形式の曲が続くときは、出力を閉じずにそのままつなぐ) */
+    @Volatile var gapless = true
+
+    // 再生スレッドから読むための写し(Compose の状態はメインスレッドで書き換える)
+    @Volatile private var snapQueue: List<PlayItem> = emptyList()
+    @Volatile private var snapRepeat = 0
+    @Volatile private var snapStopAfter = false
+
+    private fun snapshot() {
+        snapQueue = queue
+        snapRepeat = repeatMode
+        snapStopAfter = stopAfterTrack
+    }
+
+    /** 曲 id の次にギャップレスでつなげる曲(つなげられなければ null)。再生スレッドから呼ぶ */
+    private fun gaplessAfter(id: Long, cdMode: Boolean): PlayItem? {
+        if (!gapless || snapStopAfter || snapRepeat == 2) return null
+        val q = snapQueue
+        val i = q.indexOfFirst { it.id == id }
+        if (i < 0) return null
+        val n = when {
+            i < q.lastIndex -> q[i + 1]
+            snapRepeat == 1 && q.size > 1 -> q[0]
+            else -> null
+        } ?: return null
+        if (cdMode) return n.takeIf { it.cdTrack != null }
+        val u = n.uri ?: return null
+        if (n.cdTrack != null || isDsdUri(u)) return null
+        return n
+    }
+
+    /** 出力が切り替わり位置まで進んだら、画面の曲を次の曲にする */
+    private fun applySwitches(owner: Any, seg: Segments, head: Long) {
+        while (true) {
+            val sw = seg.pending.peek() ?: break
+            if (head < sw.frame) break
+            seg.pending.poll()
+            seg.startFrame = sw.frame
+            seg.baseMs = sw.baseMs
+            if (owner !== file && owner !== cd) continue
+            val i = queue.indexOfFirst { it.id == sw.item.id }
+            if (i >= 0) index = i
+            durationMs = if (sw.durationMs > 0) sw.durationMs else sw.item.durationMs
+            positionMs = sw.baseMs
+            changed()
+        }
+    }
+
+    /** 曲の切り替わりを今すぐ画面に反映する(操作の前に、今どの曲が鳴っているかを正しくするため) */
+    private fun syncSwitches() {
+        val c = cd
+        val f = file
+        if (c != null) {
+            applySwitches(c, c.seg, c.head())
+            positionMs = c.positionMs()
+        } else if (f != null) {
+            val sg = f.seg ?: return
+            applySwitches(f, sg, f.head())
+            positionMs = f.positionMs()
+        }
+    }
+
+    /**
+     * 次の曲をもうつないでしまった後で、再生リストや設定が変わり、
+     * つないだ曲が「本当の次の曲」でなくなったら、今の位置から出力を作り直す。
+     */
+    private fun rejoinIfStale() {
+        val sg = cd?.seg ?: file?.seg ?: return
+        val sw = sg.pending.peek() ?: return
+        val nextId = queue.getOrNull(index + 1)?.id
+            ?: if (repeatMode == 1 && queue.size > 1) queue[0].id else null
+        if (sw.item.id != nextId || repeatMode == 2 || stopAfterTrack || !gapless) {
+            startCurrent(positionMs, isPlaying)
+        }
+    }
+
+    /** スリープタイマー(分。0 で解除) */
+    fun setSleep(minutes: Int) {
+        sleepAtMs = if (minutes > 0) android.os.SystemClock.elapsedRealtime() + minutes * 60_000L else 0L
+        stopAfterTrack = false
+        snapshot()
+    }
+
+    fun stopAtTrackEnd(on: Boolean) {
+        syncSwitches()
+        stopAfterTrack = on
+        snapshot()
+        if (on) sleepAtMs = 0L
+        rejoinIfStale()
+    }
+
+    /** 保存用: シャッフル前の並び(シャッフルしていなければ今の並び) */
+    val originalOrder: List<PlayItem> get() = original
+
     fun cycleRepeat() {
+        syncSwitches()
         repeatMode = (repeatMode + 1) % 3
         publish()
+        rejoinIfStale()
     }
 
     fun toggleShuffle() {
+        syncSwitches()
         val cur = current
         shuffle = !shuffle
         if (cur != null && original.isNotEmpty()) {
@@ -212,6 +441,7 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
             }
         }
         publish()
+        rejoinIfStale()
     }
 
     /** ジャケット画像(通知・ロック画面用) */
@@ -221,6 +451,7 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
     }
 
     private fun publish() {
+        snapshot()
         val cur = current
         if (cur == null) {
             runCatching { session.isActive = false }
@@ -282,23 +513,24 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
         durationMs = item.durationMs
         positionMs = fromMs
         isPlaying = play
+        if (play) started = true
         val t = item.cdTrack
         val d = drive
         if (t != null && d != null) {
-            val c = CdStream(d, t, (fromMs * 75 / 1000).toInt(), !play)
+            val c = CdStream(d, item, t, (fromMs * 75 / 1000).toInt(), !play)
             cd = c
             c.start()
         } else if (item.uri != null) {
-            startFile(item.uri, fromMs)
+            startFile(item, item.uri, fromMs)
         } else {
             isPlaying = false
         }
         changed()
     }
 
-    private fun startFile(uri: Uri, fromMs: Long) {
+    private fun startFile(item: PlayItem, uri: Uri, fromMs: Long) {
         val f: PlayStream = if (isDsdUri(uri)) DsdStream(uri, fromMs, !isPlaying)
-        else FileStream(uri, fromMs, !isPlaying)
+        else FileStream(item, fromMs, !isPlaying)
         file = f
         f.start()
     }
@@ -310,6 +542,7 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
             return
         }
         AudioEngine.releaseUnused(am, attrs)
+        syncSwitches()
         startCurrent(positionMs, isPlaying)
     }
 
@@ -317,6 +550,7 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
 
     fun pause() {
         if (!isPlaying) return
+        syncSwitches()
         file?.pauseAudio()
         cd?.pauseAudio()
         isPlaying = false
@@ -338,6 +572,21 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
     }
 
     fun next(auto: Boolean = false) {
+        if (auto && stopAfterTrack) {
+            // スリープタイマー「この曲の終わりで停止」
+            stopAfterTrack = false
+            if (index < queue.lastIndex) {
+                index++
+                startCurrent(0, false)
+            } else {
+                halt()
+                isPlaying = false
+                positionMs = 0
+                changed()
+            }
+            return
+        }
+        if (!auto) syncSwitches()
         if (auto && repeatMode == 2) {
             startCurrent(0, true)
         } else if (index < queue.lastIndex) {
@@ -357,6 +606,7 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
     }
 
     fun prev() {
+        syncSwitches()
         if (positionMs > 3000 || index <= 0) { seek(0); return }
         val play = isPlaying
         index--
@@ -364,11 +614,15 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
     }
 
     fun seek(ms: Long) {
+        // 曲の切り替わりの直後でも、今鳴っている曲の中で動かす
+        syncSwitches()
         if (current != null) startCurrent(ms.coerceAtLeast(0), isPlaying)
     }
 
     fun stop() {
         halt()
+        sleepAtMs = 0L
+        stopAfterTrack = false
         queue = emptyList()
         original = emptyList()
         index = -1
@@ -394,7 +648,20 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
 
     /** 端末内のファイルを、OS内蔵のデコーダで PCM にして再生する */
     /** ファイル再生のスレッド(PCM と DSD で共通の操作) */
+    /** ギャップレスで次の曲へ切り替わる位置(出力の何フレーム目から次の曲か) */
+    private class Switch(val item: PlayItem, val frame: Long, val baseMs: Long, val durationMs: Long)
+
+    /** 今再生している曲が、出力の何フレーム目から始まったか */
+    private class Segments {
+        @Volatile var startFrame = 0L
+        @Volatile var baseMs = 0L
+        val pending = java.util.concurrent.ConcurrentLinkedQueue<Switch>()
+    }
+
     private abstract inner class PlayStream(name: String) : Thread(name) {
+        /** ギャップレス対応の流れなら、曲の切り替わり位置 */
+        open val seg: Segments? get() = null
+        open fun head(): Long = 0L
         abstract fun positionMs(): Long
         abstract fun pauseAudio()
         abstract fun resumeAudio()
@@ -495,87 +762,88 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
         }
     }
 
-    private inner class FileStream(
-        val uri: Uri,
-        val fromMs: Long,
-        val startPaused: Boolean,
-    ) : PlayStream("file-play") {
-        @Volatile private var stopFlag = false
-        @Volatile private var out: AudioOutput? = null
-        @Volatile private var paused = startPaused
-        @Volatile private var baseUs = fromMs * 1000
+    /** 再生する PCM の元(WAV を直接読む / OS のデコーダーで変換する) */
+    private abstract class PcmSource {
+        var rate = 0
+        var channels = 2
+        var bits = 16
+        var durationMs = 0L
+        /** 最初に渡した音声の時刻(マイクロ秒。まだなら -1) */
+        var firstPtsUs = -1L
 
-        override fun positionMs(): Long {
-            val o = out ?: return baseUs / 1000
-            return baseUs / 1000 + o.headFrames() * 1000L / o.sampleRate
+        /** 次の音声を sink に渡す。終わりに達したら false(最後の分は渡してから false を返す) */
+        abstract fun read(sink: (java.nio.ByteBuffer, Int) -> Unit): Boolean
+        abstract fun close()
+    }
+
+    /** WAV を直接読む(デコーダーを通すと 24bit が 16bit に丸められることがあるため) */
+    private inner class WavSource(private val inp: java.io.InputStream, w: WavInfo, fromMs: Long) : PcmSource() {
+        private val enc = w.enc
+        private val align = w.align
+        private val buf: ByteArray = ByteArray(w.align * (w.rate / 20).coerceAtLeast(256))
+        private val bb = java.nio.ByteBuffer.wrap(buf)
+        private var left: Long
+
+        init {
+            rate = w.rate
+            channels = w.channels
+            bits = w.bits
+            val total = if (w.dataLen in 1 until 0xFFFFFFFFL) w.dataLen / w.align else Long.MAX_VALUE
+            if (total != Long.MAX_VALUE) durationMs = total * 1000L / w.rate
+            val start = (fromMs * w.rate / 1000).coerceIn(0L, total)
+            skipFully(inp, start * w.align)
+            firstPtsUs = start * 1_000_000L / w.rate
+            left = if (total == Long.MAX_VALUE) Long.MAX_VALUE else (total - start) * w.align
         }
 
-        override fun pauseAudio() { paused = true; out?.pause() }
-        override fun resumeAudio() { paused = false; out?.play() }
-
-        override fun halt() {
-            stopFlag = true
-            out?.pause()
+        override fun read(sink: (java.nio.ByteBuffer, Int) -> Unit): Boolean {
+            if (left <= 0) return false
+            val want = minOf(buf.size.toLong(), left).toInt()
+            val n = readFully(inp, buf, want)
+            val usable = n - n % align
+            if (usable <= 0) { left = 0; return false }
+            bb.clear()
+            bb.limit(usable)
+            sink(bb, enc)
+            if (left != Long.MAX_VALUE) left -= usable
+            if (n < want) { left = 0; return false }
+            return left > 0
         }
 
-        /** WAV を直接読んで再生する。WAV として扱えなければ false(通常のデコードに任せる) */
-        private fun playWav(): Boolean {
-            val name = runCatching { androidx.documentfile.provider.DocumentFile.fromSingleUri(ctx, uri)?.name }.getOrNull()
-            val looksWav = name?.lowercase()?.endsWith(".wav") == true ||
-                runCatching { ctx.contentResolver.getType(uri) }.getOrNull()?.contains("wav") == true
-            if (!looksWav) return false
-            val raw = runCatching { ctx.contentResolver.openInputStream(uri) }.getOrNull() ?: return false
-            val inp = java.io.BufferedInputStream(raw, 1 shl 16)
-            val w = runCatching { parseWav(inp) }.getOrNull()
-            if (w == null) {
-                runCatching { inp.close() }
-                return false
-            }
-            try {
-                val total = if (w.dataLen in 1 until 0xFFFFFFFFL) w.dataLen / w.align else Long.MAX_VALUE
-                if (total != Long.MAX_VALUE) {
-                    val d = total * 1000L / w.rate
-                    main.post { if (file === this) { durationMs = d; publish() } }
-                }
-                AudioEngine.log("wav: ${w.rate} Hz ${w.channels}ch ${AudioEngine.encName(w.enc)} (direct)")
-                val start = (fromMs * w.rate / 1000).coerceIn(0L, if (total == Long.MAX_VALUE) Long.MAX_VALUE else total)
-                skipFully(inp, start * w.align)
-                baseUs = start * 1_000_000L / w.rate
-                val o = AudioOutput(ctx, attrs, w.rate, w.channels, w.bits)
-                out = o
-                if (!paused) o.play()
-                val buf = ByteArray(w.align * (w.rate / 20).coerceAtLeast(256))
-                val bb = java.nio.ByteBuffer.wrap(buf)
-                var left = if (total == Long.MAX_VALUE) Long.MAX_VALUE else (total - start) * w.align
-                while (!stopFlag && left > 0) {
-                    val want = minOf(buf.size.toLong(), left).toInt()
-                    val n = readFully(inp, buf, want)
-                    val usable = n - n % w.align
-                    if (usable <= 0) break
-                    bb.clear()
-                    bb.limit(usable)
-                    o.write(bb, w.enc) { stopFlag }
-                    if (left != Long.MAX_VALUE) left -= usable
-                    if (n < want) break
-                }
-                while (!stopFlag && o.headFrames() < o.framesWritten) Thread.sleep(50)
-                if (!stopFlag) main.post { if (file === this) next(true) }
-            } catch (e: Exception) {
-                AudioEngine.log("playback error: ${e.javaClass.simpleName}: ${e.message}")
-                if (!stopFlag) main.post { if (file === this) next(true) }
-            } finally {
-                runCatching { inp.close() }
-                out?.release()
-            }
-            return true
-        }
+        override fun close() { runCatching { inp.close() } }
+    }
 
-        override fun run() {
-            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO) }
-            // WAV はデコーダーを通すと 16bit に丸められることがあるため、自前で読んでそのまま出力する
-            if (playWav()) return
-            val ex = MediaExtractor()
-            var codec: MediaCodec? = null
+    /** WAV なら直接読む元を作る。WAV として扱えなければ null(理由はログに出す) */
+    private fun openWav(uri: Uri, fromMs: Long): PcmSource? {
+        val name = runCatching { androidx.documentfile.provider.DocumentFile.fromSingleUri(ctx, uri)?.name }.getOrNull()
+        val looksWav = name?.lowercase()?.endsWith(".wav") == true ||
+            runCatching { ctx.contentResolver.getType(uri) }.getOrNull()?.contains("wav") == true
+        if (!looksWav) return null
+        val raw = runCatching { ctx.contentResolver.openInputStream(uri) }.getOrNull()
+        if (raw == null) { AudioEngine.log("wav: cannot open, using decoder"); return null }
+        val inp = java.io.BufferedInputStream(raw, 1 shl 16)
+        val w = runCatching { parseWav(inp) }.getOrNull()
+        if (w == null) {
+            AudioEngine.log("wav: unsupported header ($lastWavReason), using decoder")
+            runCatching { inp.close() }
+            return null
+        }
+        AudioEngine.log("wav: ${w.rate} Hz ${w.channels}ch ${AudioEngine.encName(w.enc)} (direct)")
+        return runCatching { WavSource(inp, w, fromMs) }.getOrElse { runCatching { inp.close() }; null }
+    }
+
+    /** OS 内蔵のデコーダーで PCM にする */
+    private inner class CodecSource(uri: Uri, fromMs: Long) : PcmSource() {
+        private val ex = MediaExtractor()
+        private var codec: MediaCodec? = null
+        private val info = MediaCodec.BufferInfo()
+        private var inEos = false
+        private var outEos = false
+        private var outFmt: MediaFormat? = null
+        /** 準備のときに取り出した、まだ渡していない出力 */
+        private var pending = -1
+
+        init {
             try {
                 ex.setDataSource(ctx, uri, null)
                 val ti = (0 until ex.trackCount).first {
@@ -584,15 +852,13 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
                 ex.selectTrack(ti)
                 val fmt = ex.getTrackFormat(ti)
                 val mime = fmt.getString(MediaFormat.KEY_MIME)!!
-                if (fmt.containsKey(MediaFormat.KEY_DURATION)) {
-                    val d = fmt.getLong(MediaFormat.KEY_DURATION) / 1000
-                    main.post { if (file === this) { durationMs = d; publish() } }
-                }
+                if (fmt.containsKey(MediaFormat.KEY_DURATION)) durationMs = fmt.getLong(MediaFormat.KEY_DURATION) / 1000
                 val srcBits = AudioInfo.bitsOf(ctx, uri)
+                bits = srcBits
                 if (fromMs > 0) ex.seekTo(fromMs * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-                // 24bit などの音源は、精度を落とさないよう float で受け取る
                 val c = MediaCodec.createDecoderByType(mime)
                 codec = c
+                // 24bit などの音源は、精度を落とさないよう float で受け取る
                 // audio/raw(WAV など)では KEY_PCM_ENCODING は「入力データの形式」を表すので書き換えない
                 val raw = mime == MediaFormat.MIMETYPE_AUDIO_RAW
                 val wantFloat = !raw && srcBits != 16 && !fmt.containsKey(MediaFormat.KEY_PCM_ENCODING)
@@ -610,71 +876,210 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
                 }
                 c.start()
                 AudioEngine.log("decoder: ${c.name}")
-                val info = MediaCodec.BufferInfo()
-                var inEos = false
-                var outEos = false
-                var outFmt: MediaFormat? = null
-                var first = true
-                while (!stopFlag && !outEos) {
-                    if (!inEos) {
-                        val i = c.dequeueInputBuffer(10_000)
-                        if (i >= 0) {
-                            val b = c.getInputBuffer(i)!!
-                            val n = ex.readSampleData(b, 0)
-                            if (n < 0) {
-                                c.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                inEos = true
-                            } else {
-                                c.queueInputBuffer(i, 0, n, ex.sampleTime, 0)
-                                ex.advance()
-                            }
-                        }
-                    }
-                    val o = c.dequeueOutputBuffer(info, 10_000)
-                    if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        outFmt = c.outputFormat
-                    } else if (o >= 0) {
-                        val f = outFmt ?: c.outputFormat
-                        if (out == null) {
-                            val sr = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                            val ch = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                            val pe = if (f.containsKey(MediaFormat.KEY_PCM_ENCODING)) f.getInteger(MediaFormat.KEY_PCM_ENCODING) else AFormat.ENCODING_PCM_16BIT
-                            AudioEngine.log("decoded: $sr Hz ${ch}ch ${AudioEngine.encName(pe)}")
-                            val created = AudioOutput(ctx, attrs, sr, ch, srcBits)
-                            out = created
-                            if (!paused) created.play()
-                        }
-                        if (first) {
-                            baseUs = info.presentationTimeUs.coerceAtLeast(0)
-                            first = false
-                        }
-                        val enc = if (f.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
-                            f.getInteger(MediaFormat.KEY_PCM_ENCODING)
-                        } else AFormat.ENCODING_PCM_16BIT
-                        if (info.size > 0) {
-                            val bb = c.getOutputBuffer(o)!!
-                            bb.position(info.offset)
-                            bb.limit(info.offset + info.size)
-                            out?.write(bb, enc) { stopFlag }
-                        }
-                        c.releaseOutputBuffer(o, false)
-                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outEos = true
+                prime()
+            } catch (e: Exception) {
+                close()
+                throw e
+            }
+        }
+
+        /** 入力を 1 回入れて、出力を 1 回取り出す */
+        private fun step(): Int {
+            val c = codec ?: return -1
+            if (!inEos) {
+                val i = c.dequeueInputBuffer(10_000)
+                if (i >= 0) {
+                    val b = c.getInputBuffer(i)!!
+                    val n = ex.readSampleData(b, 0)
+                    if (n < 0) {
+                        c.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inEos = true
+                    } else {
+                        c.queueInputBuffer(i, 0, n, ex.sampleTime, 0)
+                        ex.advance()
                     }
                 }
-                val o = out
-                if (o != null) {
-                    while (!stopFlag && o.headFrames() < o.framesWritten) Thread.sleep(50)
+            }
+            val o = c.dequeueOutputBuffer(info, 10_000)
+            if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) outFmt = c.outputFormat
+            return o
+        }
+
+        /** 出力の形式(周波数・チャンネル数)が分かるまで進める */
+        private fun prime() {
+            val c = codec ?: return
+            var guard = 0
+            while (outFmt == null && pending < 0) {
+                val o = step()
+                if (o >= 0) pending = o
+                if (++guard > 3000) throw java.io.IOException("decoder did not start")
+            }
+            val f = outFmt ?: c.outputFormat
+            rate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            val pe = if (f.containsKey(MediaFormat.KEY_PCM_ENCODING)) f.getInteger(MediaFormat.KEY_PCM_ENCODING) else AFormat.ENCODING_PCM_16BIT
+            AudioEngine.log("decoded: $rate Hz ${channels}ch ${AudioEngine.encName(pe)}")
+        }
+
+        override fun read(sink: (java.nio.ByteBuffer, Int) -> Unit): Boolean {
+            val c = codec ?: return false
+            if (outEos) return false
+            val o = if (pending >= 0) pending.also { pending = -1 } else step()
+            // まだ出力が無い(待ち時間切れ・形式の変更)ときは、止める指示を確かめられるよう一度戻る
+            if (o < 0) return true
+            val f = outFmt ?: c.outputFormat
+            val enc = if (f.containsKey(MediaFormat.KEY_PCM_ENCODING)) f.getInteger(MediaFormat.KEY_PCM_ENCODING) else AFormat.ENCODING_PCM_16BIT
+            if (firstPtsUs < 0) firstPtsUs = info.presentationTimeUs.coerceAtLeast(0)
+            if (info.size > 0) {
+                val bb = c.getOutputBuffer(o)!!
+                bb.position(info.offset)
+                bb.limit(info.offset + info.size)
+                sink(bb, enc)
+            }
+            c.releaseOutputBuffer(o, false)
+            if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outEos = true
+            return !outEos
+        }
+
+        override fun close() {
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            codec = null
+            runCatching { ex.release() }
+        }
+    }
+
+    /**
+     * 端末内のファイルを再生する。曲の終わりで、次の曲が同じ形式(周波数・チャンネル数・ビット数)なら、
+     * 出力を閉じずにそのまま続けて書き込む(ギャップレス再生)。
+     */
+    private inner class FileStream(
+        val first: PlayItem,
+        val fromMs: Long,
+        startPaused: Boolean,
+    ) : PlayStream("file-play") {
+        @Volatile private var stopFlag = false
+        @Volatile private var out: AudioOutput? = null
+        @Volatile private var paused = startPaused
+        private val segs = Segments().also { it.baseMs = fromMs }
+        override val seg: Segments get() = segs
+
+        override fun head(): Long = out?.headFrames() ?: 0L
+
+        override fun positionMs(): Long {
+            val o = out ?: return segs.baseMs
+            return segs.baseMs + (o.headFrames() - segs.startFrame).coerceAtLeast(0L) * 1000L / o.sampleRate.coerceAtLeast(1)
+        }
+
+        override fun pauseAudio() { paused = true; out?.pause() }
+        override fun resumeAudio() { paused = false; out?.play() }
+
+        override fun halt() {
+            stopFlag = true
+            out?.pause()
+        }
+
+        private fun open(item: PlayItem, from: Long): PcmSource {
+            val uri = item.uri ?: throw java.io.IOException("no file")
+            return openWav(uri, from) ?: CodecSource(uri, from)
+        }
+
+        override fun run() {
+            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO) }
+            var src: PcmSource? = null
+            try {
+                var item = first
+                var cur = open(item, fromMs)
+                src = cur
+                val d0 = cur.durationMs
+                if (d0 > 0) main.post { if (file === this) { durationMs = d0; publish() } }
+                val o = AudioOutput(ctx, attrs, cur.rate, cur.channels, cur.bits)
+                out = o
+                if (stopFlag) return
+                if (!paused) o.play()
+                var firstData = true
+                val sink: (java.nio.ByteBuffer, Int) -> Unit = { bb, enc -> o.write(bb, enc) { stopFlag } }
+                prefetch(item)
+                while (!stopFlag) {
+                    while (!stopFlag) {
+                        val more = cur.read(sink)
+                        if (firstData && cur.firstPtsUs >= 0) {
+                            firstData = false
+                            segs.baseMs = cur.firstPtsUs / 1000
+                        }
+                        if (!more) break
+                    }
+                    if (stopFlag) break
+                    // ギャップレス: 次の曲が同じ形式なら、出力を閉じずに続ける
+                    val nx = gaplessAfter(item.id, false) ?: break
+                    // 先に開いておいた次の曲を使う(違う曲になっていたら開き直す)
+                    val ready = takePrefetched(nx)
+                    val opened: PcmSource? = ready ?: try {
+                        open(nx, 0)
+                    } catch (e: Exception) {
+                        AudioEngine.log("gapless: cannot open next (${e.javaClass.simpleName})")
+                        null
+                    }
+                    val ns = opened ?: break
+                    if (ns.rate != cur.rate || ns.channels != cur.channels || ns.bits != cur.bits) {
+                        AudioEngine.log("gapless: format changes (${ns.rate} Hz ${ns.bits}bit), reopening output")
+                        ns.close()
+                        break
+                    }
+                    cur.close()
+                    segs.pending.add(Switch(nx, o.framesWritten, 0L, ns.durationMs))
+                    AudioEngine.log("gapless: next track joined")
+                    cur = ns
+                    src = ns
+                    item = nx
+                    prefetch(item)
                 }
-                if (!stopFlag) main.post { if (file === this) next(true) }
+                while (!stopFlag && o.headFrames() < o.framesWritten) Thread.sleep(50)
+                if (!stopFlag) main.post { if (file === this) { applySwitches(this, segs, Long.MAX_VALUE); next(true) } }
             } catch (e: Exception) {
                 AudioEngine.log("playback error: ${e.javaClass.simpleName}: ${e.message}")
-                if (!stopFlag) main.post { if (file === this) next(true) }
+                // 書き込み済みの分(前の曲の終わり)は鳴らし切ってから次へ
+                out?.let { o -> while (!stopFlag && o.headFrames() < o.framesWritten) Thread.sleep(50) }
+                if (!stopFlag) main.post { if (file === this) { applySwitches(this, segs, Long.MAX_VALUE); next(true) } }
             } finally {
-                runCatching { codec?.stop() }
-                runCatching { codec?.release() }
-                runCatching { ex.release() }
+                src?.close()
+                discardPrefetch()
+                prefetchExec.shutdown()
                 out?.release()
             }
+        }
+
+        // ---- 次の曲の先読み(曲の境目で開く時間を待たないように) ----
+        private val prefetchExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+        private var pre: Pair<Long, java.util.concurrent.Future<PcmSource?>>? = null
+
+        private fun prefetch(after: PlayItem) {
+            discardPrefetch()
+            val nx = gaplessAfter(after.id, false) ?: return
+            pre = nx.id to prefetchExec.submit(java.util.concurrent.Callable<PcmSource?> {
+                if (stopFlag) null else runCatching { open(nx, 0) }.getOrNull()
+            })
+        }
+
+        private fun takePrefetched(nx: PlayItem): PcmSource? {
+            val p = pre ?: return null
+            pre = null
+            if (p.first != nx.id) {
+                discard(p.second)
+                return null
+            }
+            return runCatching { p.second.get() }.getOrNull()
+        }
+
+        private fun discardPrefetch() {
+            val p = pre ?: return
+            pre = null
+            discard(p.second)
+        }
+
+        /** 使わない先読みは、開き終わってから閉じる */
+        private fun discard(f: java.util.concurrent.Future<PcmSource?>) {
+            runCatching { prefetchExec.execute { runCatching { f.get()?.close() } } }
         }
     }
 
@@ -703,7 +1108,11 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
     }
 
     /** WAV のヘッダーを読み、data チャンクの先頭まで進める。扱えない形式なら null */
+    /** WAV を直接読めなかった理由(ログ用) */
+    @Volatile private var lastWavReason = ""
+
     private fun parseWav(inp: java.io.InputStream): WavInfo? {
+        lastWavReason = "header"
         val iso = Charsets.ISO_8859_1
         fun le16(b: ByteArray, i: Int) = (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8)
         fun le32(b: ByteArray, i: Int): Long = (le16(b, i).toLong()) or (le16(b, i + 2).toLong() shl 16)
@@ -728,6 +1137,7 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
                     haveFmt = true
                 }
                 "data" -> {
+                    lastWavReason = "tag=$tag ch=$ch rate=$sr bits=$bits align=$align"
                     if (!haveFmt) return null
                     val enc = when {
                         tag == 1 && bits == 8 -> AFormat.ENCODING_PCM_8BIT
@@ -737,6 +1147,7 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
                         tag == 3 && bits == 32 -> AFormat.ENCODING_PCM_FLOAT
                         else -> return null
                     }
+                    lastWavReason = "tag=$tag ch=$ch rate=$sr bits=$bits align=$align"
                     if (ch !in 1..2 || sr <= 0 || align != ch * bits / 8) return null
                     return WavInfo(enc, ch, sr, bits, align, len)
                 }
@@ -747,7 +1158,8 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
 
     private inner class CdStream(
         val d: UsbScsiDrive,
-        val track: TocTrack,
+        val firstItem: PlayItem,
+        val firstTrack: TocTrack,
         val baseSector: Int,
         val startPaused: Boolean,
     ) : Thread("cd-play") {
@@ -755,8 +1167,11 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
         // 出力はスレッドの中で作る(USB DAC の準備で画面が止まらないように)
         @Volatile private var out: AudioOutput? = null
         @Volatile private var paused = startPaused
+        val seg = Segments().also { it.baseMs = baseSector * 1000L / 75 }
 
-        fun positionMs(): Long = (baseSector * 588L + (out?.headFrames() ?: 0L)) * 1000L / 44100L
+        fun head(): Long = out?.headFrames() ?: 0L
+
+        fun positionMs(): Long = seg.baseMs + (head() - seg.startFrame).coerceAtLeast(0L) * 1000L / 44100L
 
         fun pauseAudio() { paused = true; out?.pause() }
         fun resumeAudio() { paused = false; out?.play() }
@@ -778,24 +1193,37 @@ class PlayerController(private val ctx: Context, scope: CoroutineScope) {
             return ByteArray(n * 2352)
         }
 
+        private fun endOf(t: TocTrack) = if (leadOut > 0) minOf(t.endLba, leadOut) else t.endLba
+
         override fun run() {
             runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO) }
             runCatching { d.setSpeed(cdSpeedX * 176) }
-            val end = if (leadOut > 0) minOf(track.endLba, leadOut) else track.endLba
-            var lba = track.startLba + baseSector
+            var item = firstItem
+            var end = endOf(firstTrack)
+            var lba = firstTrack.startLba + baseSector
             try {
                 val o = AudioOutput(ctx, attrs, 44100, 2, 16)
                 out = o
                 if (stopFlag) return
                 if (!paused) o.play()
-                while (!stopFlag && lba < end) {
-                    val n = minOf(27, end - lba)
-                    val data = readSafe(lba, n)
-                    o.write(java.nio.ByteBuffer.wrap(data, 0, n * 2352), AFormat.ENCODING_PCM_16BIT) { stopFlag }
-                    lba += n
+                while (!stopFlag) {
+                    while (!stopFlag && lba < end) {
+                        val n = minOf(27, end - lba)
+                        val data = readSafe(lba, n)
+                        o.write(java.nio.ByteBuffer.wrap(data, 0, n * 2352), AFormat.ENCODING_PCM_16BIT) { stopFlag }
+                        lba += n
+                    }
+                    if (stopFlag) break
+                    // ギャップレス: 次の曲も CD の曲なら、そのまま読み続ける
+                    val nx = gaplessAfter(item.id, true) ?: break
+                    val t = nx.cdTrack ?: break
+                    seg.pending.add(Switch(nx, o.framesWritten, 0L, nx.durationMs))
+                    item = nx
+                    lba = t.startLba
+                    end = endOf(t)
                 }
                 while (!stopFlag && o.headFrames() < o.framesWritten) Thread.sleep(50)
-                if (!stopFlag) main.post { if (cd === this) next(true) }
+                if (!stopFlag) main.post { if (cd === this) { applySwitches(this, seg, Long.MAX_VALUE); next(true) } }
             } catch (e: Exception) {
                 // 停止・切断時
             } finally {
