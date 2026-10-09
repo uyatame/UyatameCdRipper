@@ -173,12 +173,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var albums by mutableStateOf<List<LibAlbum>>(emptyList())
         private set
     var libScanning by mutableStateOf(false)
+        private set
     /** すべての曲を読み直しているか(false なら新しい曲だけ) */
     var libFull by mutableStateOf(false)
         private set
     /** 今回タグを読む曲の数 */
     var libNew by mutableIntStateOf(0)
-        private set
         private set
     var libProgress by mutableStateOf("")
         private set

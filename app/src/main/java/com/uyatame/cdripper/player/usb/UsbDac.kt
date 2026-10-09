@@ -493,7 +493,15 @@ object UsbDac {
     }
 
     private fun stopStream() {
-        stream?.let { it.halt(); runCatching { it.join(1500) } }
+        stream?.let {
+            // いきなり止めると DAC から雑音が出ることがあるので、少しのあいだ無音を送ってから止める
+            if (it.isAlive) {
+                it.silenceOnly = true
+                runCatching { Thread.sleep(80) }
+            }
+            it.halt()
+            runCatching { it.join(1500) }
+        }
         stream = null
         format = null
         curAlt = null
@@ -640,6 +648,8 @@ object UsbDac {
         private val freqn: Long = ((fmt.rate.toLong() shl 16) + busRate / 2) / busRate
         @Volatile private var freqm: Long = freqn
         private var freqShift = Int.MIN_VALUE
+        private var fbCount = 0
+        private var fbRejected = 0
         private var phase: Long = 0
 
         private val urbs = ArrayList<IsoUrb>()
@@ -659,13 +669,31 @@ object UsbDac {
             return min((phase shr 16).toInt(), maxFramesPerPacket)
         }
 
+        /** 転送を始めた時刻(DAC が新しい周波数に落ち着くまで、音声を送らずに無音を送る) */
+        private val startedAt = SystemClock.elapsedRealtime()
+        /** DAC から正しい速度の報告を受け取った回数 */
+        @Volatile private var fbAccepted = 0
+        /** 止める前に無音だけを送る(切り替え時の雑音を防ぐ) */
+        @Volatile var silenceOnly = false
+
+        /** 音声を送ってよい状態か: 開始直後は DAC の周波数が安定するまで待つ */
+        private fun warmedUp(): Boolean {
+            if (silenceOnly) return false
+            val t = SystemClock.elapsedRealtime() - startedAt
+            if (t < 150) return false
+            val needFb = alt.syncType == 1 && alt.epFb >= 0
+            // 速度の報告が正しい値になるまで待つ(最大 1 秒)
+            return !needFb || fbAccepted >= 4 || t > 1000
+        }
+
         private fun fill(u: IsoUrb) {
             var off = 0L
             var real = 0
+            val ok = warmedUp()
             for (p in 0 until u.packets) {
                 val frames = nextPacketFrames()
                 val bytes = frames * fmt.frameBytes
-                val got = ring.read(u.buf, off, bytes)
+                val got = if (ok) ring.read(u.buf, off, bytes) else 0
                 if (got < bytes) u.buf.setMemory(off + got, (bytes - got).toLong(), fmt.fill)
                 real += got / fmt.frameBytes
                 lengths[p] = bytes
@@ -689,22 +717,40 @@ object UsbDac {
         private fun handleFeedback(u: IsoUrb) {
             val n = u.packetActual(0)
             if (u.status() != 0 || n < 3) return
-            var f: Long = if (n == 3) {
+            val f: Long = if (n == 3) {
                 ((u.buf.getByte(0).toLong() and 0xFF) or ((u.buf.getByte(1).toLong() and 0xFF) shl 8) or
                     ((u.buf.getByte(2).toLong() and 0xFF) shl 16)) shl 2
             } else {
                 (u.buf.getInt(0).toLong() and 0x0FFFFFFFL)
             }
             if (f == 0L) return
-            // 機器ごとに単位がずれていることがあるので、公称値に近づくように桁を合わせる(Linux と同じ方法)
-            if (freqShift == Int.MIN_VALUE) {
-                var s = 0
-                while (f < freqn - freqn / 4 && s < 8) { f = f shl 1; s++ }
-                while (f > freqn + freqn / 2 && s > -8) { f = f shr 1; s-- }
-                freqShift = s
-                AudioEngine.log("usb dac: feedback ${"%.4f".format(f / 65536.0)} frames/interval (shift $s, nominal ${"%.4f".format(freqn / 65536.0)})")
-            } else if (freqShift >= 0) f = f shl freqShift else f = f shr -freqShift
-            if (f >= freqn - freqn / 8 && f <= freqn + freqn / 4) freqm = f
+            // 機器ごとに単位(桁)がずれていることがあるので、公称値の ±2% に入る桁を毎回探す。
+            // 周波数を切り替えた直前は、前の周波数の値を返してくる DAC がある(iBasso など)ので、
+            // 公称値から大きく外れた値は使わない(以前は最初の値で桁を決め打ちしていたため、
+            // 前の周波数の値で桁を誤り、速さがずれて早送りのような音になっていた)
+            val tol = freqn / 50
+            var picked = -1L
+            var shiftUsed = 0
+            for (sft in intArrayOf(0, -1, 1, -2, 2, -3, 3, -4, 4)) {
+                val v = if (sft >= 0) f shl sft else f shr -sft
+                if (v >= freqn - tol && v <= freqn + tol) { picked = v; shiftUsed = sft; break }
+            }
+            fbCount++
+            if (picked < 0) {
+                fbRejected++
+                if (fbRejected == 1 || fbRejected % 500 == 0) {
+                    AudioEngine.log(
+                        "usb dac: feedback ignored ${"%.4f".format(f / 65536.0)} (nominal ${"%.4f".format(freqn / 65536.0)}, rejected $fbRejected)",
+                    )
+                }
+                return
+            }
+            if (freqShift != shiftUsed) {
+                freqShift = shiftUsed
+                AudioEngine.log("usb dac: feedback ${"%.4f".format(picked / 65536.0)} frames/interval (shift $shiftUsed, nominal ${"%.4f".format(freqn / 65536.0)})")
+            }
+            freqm = picked
+            fbAccepted++
         }
 
         override fun run() {
