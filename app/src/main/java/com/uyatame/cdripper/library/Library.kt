@@ -75,33 +75,64 @@ class Library(private val ctx: Context) {
         runCatching { cacheFile.writeText(a.toString()) }
     }
 
+    /** 同時に処理する数(フォルダの一覧取得・タグの読み込み) */
+    private val workers = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
+
+    /**
+     * フォルダ内の曲を一覧にする。読み込み済み(前回から変わっていない)の曲はそのまま使い、
+     * 新しく入った曲・書き換えられた曲だけタグを読む。消えた曲は一覧から外れる。
+     * フォルダの一覧取得とタグの読み込みは、複数のスレッドで同時に行う。
+     * progress は「タグを読む曲」の件数で数える。
+     */
     fun scan(tree: Uri, old: List<LibTrack>, progress: (Int, Int) -> Unit): List<LibTrack> {
-        val found = ArrayList<Triple<Uri, String, Long>>()
-        val names = HashMap<String, String>()
-        val covers = HashMap<String, String>()
-        walk(tree, DocumentsContract.getTreeDocumentId(tree), 0, found, names, covers)
-        val oldMap = old.associateBy { it.uri }
-        val out = ArrayList<LibTrack>()
-        found.forEachIndexed { i, (uri, folder, mod) ->
-            progress(i + 1, found.size)
-            val key = uri.toString()
-            val o = oldMap[key]
-            if (o != null && o.modified == mod && mod != 0L) {
-                out.add(o.copy(coverUri = covers[folder]))
-            } else {
-                out.add(readTags(uri, names[key] ?: "", folder, covers[folder], mod))
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(workers)
+        try {
+            val found = java.util.Collections.synchronizedList(ArrayList<Triple<Uri, String, Long>>())
+            val names = java.util.concurrent.ConcurrentHashMap<String, String>()
+            val covers = java.util.concurrent.ConcurrentHashMap<String, String>()
+            // フォルダを階層ごとにまとめて、同時に一覧を取る
+            var level = listOf(DocumentsContract.getTreeDocumentId(tree))
+            var depth = 0
+            while (level.isNotEmpty() && depth <= 8) {
+                val next = java.util.Collections.synchronizedList(ArrayList<String>())
+                pool.invokeAll(level.map { id ->
+                    java.util.concurrent.Callable { list(tree, id, found, names, covers, next) }
+                })
+                level = next.toList()
+                depth++
             }
+            val oldMap = old.associateBy { it.uri }
+            val all = found.toList()
+            val need = all.filter { (uri, _, mod) -> oldMap[uri.toString()]?.modified != mod }
+            val done = java.util.concurrent.atomic.AtomicInteger(0)
+            val read = java.util.concurrent.ConcurrentHashMap<String, LibTrack>()
+            pool.invokeAll(need.map { (uri, folder, mod) ->
+                java.util.concurrent.Callable {
+                    val key = uri.toString()
+                    read[key] = readTags(uri, names[key] ?: "", folder, covers[folder], mod)
+                    val n = done.incrementAndGet()
+                    // 表示の更新は間引く
+                    if (n == need.size || n % 5 == 0) progress(n, need.size)
+                    Unit
+                }
+            })
+            return all.mapNotNull { (uri, folder, _) ->
+                val key = uri.toString()
+                read[key] ?: oldMap[key]?.copy(coverUri = covers[folder])
+            }
+        } finally {
+            pool.shutdownNow()
         }
-        return out
     }
 
-    private fun walk(
+    /** 1 つのフォルダの中身を一覧にする(サブフォルダは next に入れる) */
+    private fun list(
         tree: Uri,
         docId: String,
-        depth: Int,
         found: MutableList<Triple<Uri, String, Long>>,
         names: MutableMap<String, String>,
         covers: MutableMap<String, String>,
+        next: MutableList<String>,
     ) {
         val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId)
         val cols = arrayOf(
@@ -110,25 +141,110 @@ class Library(private val ctx: Context) {
             DocumentsContract.Document.COLUMN_MIME_TYPE,
             DocumentsContract.Document.COLUMN_LAST_MODIFIED,
         )
-        val dirs = ArrayList<String>()
-        ctx.contentResolver.query(children, cols, null, null, null)?.use { c ->
-            while (c.moveToNext()) {
-                val id = c.getString(0) ?: continue
-                val name = c.getString(1) ?: ""
-                val mime = c.getString(2) ?: ""
-                val mod = if (c.isNull(3)) 0L else c.getLong(3)
-                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) { dirs.add(id); continue }
-                val lower = name.lowercase()
-                val uri = DocumentsContract.buildDocumentUriUsingTree(tree, id)
-                if (lower.substringAfterLast('.', "") in AUDIO_EXT) {
-                    found.add(Triple(uri, docId, mod))
-                    names[uri.toString()] = name
-                } else if (lower in COVER_NAMES) {
-                    covers[docId] = uri.toString()
+        runCatching {
+            ctx.contentResolver.query(children, cols, null, null, null)?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0) ?: continue
+                    val name = c.getString(1) ?: ""
+                    val mime = c.getString(2) ?: ""
+                    val mod = if (c.isNull(3)) 0L else c.getLong(3)
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) { next.add(id); continue }
+                    val lower = name.lowercase()
+                    if (lower.substringAfterLast('.', "") in AUDIO_EXT) {
+                        val uri = DocumentsContract.buildDocumentUriUsingTree(tree, id)
+                        found.add(Triple(uri, docId, mod))
+                        names[uri.toString()] = name
+                    } else if (lower in COVER_NAMES) {
+                        covers[docId] = DocumentsContract.buildDocumentUriUsingTree(tree, id).toString()
+                    }
                 }
             }
         }
-        if (depth < 8) for (d in dirs) walk(tree, d, depth + 1, found, names, covers)
+    }
+
+    /** 足りない分を読み切る */
+    private fun readFully(ins: java.io.InputStream, b: ByteArray): Int {
+        var off = 0
+        while (off < b.size) {
+            val r = ins.read(b, off, b.size - off)
+            if (r < 0) break
+            off += r
+        }
+        return off
+    }
+
+    /**
+     * FLAC はファイルの先頭(STREAMINFO と VORBIS_COMMENT)だけを自前で読む。
+     * Android 標準の読み取り機能より大幅に速い。読めなければ null。
+     */
+    private fun readFlacTags(uri: Uri, name: String, folder: String, cover: String?, mod: Long): LibTrack? {
+        val raw = runCatching { ctx.contentResolver.openInputStream(uri) }.getOrNull() ?: return null
+        return runCatching {
+            raw.use { r0 ->
+                val ins = java.io.BufferedInputStream(r0, 1 shl 16)
+                val head = ByteArray(4)
+                if (readFully(ins, head) != 4 || String(head, Charsets.ISO_8859_1) != "fLaC") return null
+                var rate = 0
+                var samples = 0L
+                val tags = HashMap<String, String>()
+                while (true) {
+                    val bh = ByteArray(4)
+                    if (readFully(ins, bh) != 4) break
+                    val last = (bh[0].toInt() and 0x80) != 0
+                    val type = bh[0].toInt() and 0x7F
+                    val len = ((bh[1].toInt() and 0xFF) shl 16) or ((bh[2].toInt() and 0xFF) shl 8) or (bh[3].toInt() and 0xFF)
+                    if (type == 0 || type == 4) {
+                        val b = ByteArray(len)
+                        if (readFully(ins, b) != len) break
+                        if (type == 0 && len >= 18) {
+                            fun u(i: Int) = b[i].toLong() and 0xFF
+                            rate = ((u(10) shl 12) or (u(11) shl 4) or (u(12) shr 4)).toInt()
+                            samples = ((u(13) and 0x0F) shl 32) or (u(14) shl 24) or (u(15) shl 16) or (u(16) shl 8) or u(17)
+                        } else if (type == 4) {
+                            val bb = java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                            val vlen = bb.int
+                            bb.position(bb.position() + vlen)
+                            val n = bb.int
+                            for (k in 0 until n) {
+                                if (bb.remaining() < 4) break
+                                val l = bb.int
+                                if (l < 0 || l > bb.remaining()) break
+                                val sArr = ByteArray(l)
+                                bb.get(sArr)
+                                val c = String(sArr, Charsets.UTF_8)
+                                val eq = c.indexOf('=')
+                                if (eq > 0) {
+                                    val key = c.substring(0, eq).uppercase()
+                                    if (key !in tags) tags[key] = c.substring(eq + 1).trim()
+                                }
+                            }
+                        }
+                    } else {
+                        var left = len.toLong()
+                        while (left > 0) {
+                            val sk = ins.skip(left)
+                            if (sk <= 0) break
+                            left -= sk
+                        }
+                    }
+                    if (last) break
+                }
+                val base = name.substringBeforeLast('.')
+                fun t(k: String) = tags[k]?.takeIf { it.isNotEmpty() }
+                LibTrack(
+                    uri.toString(),
+                    t("TITLE") ?: base,
+                    t("ARTIST") ?: UNKNOWN_ARTIST,
+                    t("ALBUM") ?: UNKNOWN_ALBUM,
+                    t("ALBUMARTIST") ?: t("ALBUM ARTIST") ?: "",
+                    t("TRACKNUMBER")?.substringBefore('/')?.trim()?.toIntOrNull() ?: base.take(2).toIntOrNull() ?: 0,
+                    t("DISCNUMBER")?.substringBefore('/')?.trim()?.toIntOrNull() ?: 1,
+                    if (rate > 0) samples * 1000 / rate else 0L,
+                    folder, cover, mod,
+                    (t("DATE") ?: t("YEAR"))?.take(4) ?: "",
+                )
+            }
+        }.getOrNull()
     }
 
     /** DSD(DSF / DFF)は Android 標準の機能で読めないので、自前で読む */
@@ -152,10 +268,13 @@ class Library(private val ctx: Context) {
 
     private fun readTags(uri: Uri, name: String, folder: String, cover: String?, mod: Long): LibTrack {
         if (com.uyatame.cdripper.player.dsd.DsdFile.isDsd(name)) return readDsdTags(uri, name, folder, cover, mod)
+        if (name.lowercase().endsWith(".flac")) readFlacTags(uri, name, folder, cover, mod)?.let { return it }
         val base = name.substringBeforeLast('.')
         val r = MediaMetadataRetriever()
         return try {
-            r.setDataSource(ctx, uri)
+            // ファイル記述子を直接渡す方が速い
+            val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
+            if (pfd != null) pfd.use { r.setDataSource(it.fileDescriptor) } else r.setDataSource(ctx, uri)
             fun m(k: Int): String? = r.extractMetadata(k)?.trim()?.takeIf { it.isNotEmpty() }
             val tn = m(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)?.substringBefore('/')?.toIntOrNull()
                 ?: base.take(2).toIntOrNull() ?: 0

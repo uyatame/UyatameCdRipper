@@ -330,9 +330,18 @@ private fun LibraryFoldersPage(vm: MainViewModel, s: AppSettings) {
             FilledTonalButton({ addPicker.launch(null) }) { Text(T("フォルダを追加", "Add folder")) }
             OutlinedButton({ vm.refreshLibrary(fresh = true) }, enabled = !vm.libScanning) { Text(T("読み込み直す", "Rescan")) }
         }
-        if (vm.libScanning) {
+        Text(
+            T("新しく入った曲はアプリを開いたときに自動で読み込みます。曲情報がおかしいときは「読み込み直す」ですべての曲を読み直せます",
+                "New songs are loaded automatically when the app opens. If track info looks wrong, \"Rescan\" re-reads every song"),
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (vm.libScanning && (vm.libFull || vm.libNew > 0)) {
             LinearProgressIndicator(Modifier.fillMaxWidth())
-            Text(T("曲を読み込み中 ${vm.libProgress}", "Loading songs ${vm.libProgress}"), style = MaterialTheme.typography.bodySmall)
+            Text(
+                if (vm.libFull) T("すべての曲を読み直しています ${vm.libProgress}", "Rescanning all songs ${vm.libProgress}")
+                else T("新しい曲を読み込んでいます ${vm.libProgress}", "Loading new songs ${vm.libProgress}"),
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }

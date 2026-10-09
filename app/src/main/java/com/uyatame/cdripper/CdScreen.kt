@@ -120,7 +120,15 @@ fun CdScreen(vm: MainViewModel, s: AppSettings, onOpenSettings: () -> Unit) {
                         Text(T("ディスクを読み込んでいます…", "Reading disc…"), style = MaterialTheme.typography.bodyLarge)
                     }
                 } else {
-                    EmptyState(AppIcons.Album, vm.discText.ifEmpty { T("ディスクを入れてください", "Insert a disc") }, T("音楽CDを入れると、自動で読み込みます", "Insert an audio CD and it will be read automatically"))
+                    val loading = vm.discText == T("ディスクを読み込み中…", "Loading disc…")
+                    EmptyState(
+                        AppIcons.Album,
+                        vm.discText.ifEmpty { T("ディスクを入れてください", "Insert a disc") },
+                        if (loading) T("回転が安定するまで、数秒お待ちください", "Please wait a few seconds for the disc to spin up")
+                        else T("音楽CDを入れると、自動で読み込みます", "Insert an audio CD and it will be read automatically") +
+                            "\n" + T("表示されないときは「読み直す」を押してください", "If nothing appears, tap \"Reload\""),
+                        T("読み直す", "Reload"),
+                    ) { vm.refreshDisc() }
                 }
             }
             else -> {

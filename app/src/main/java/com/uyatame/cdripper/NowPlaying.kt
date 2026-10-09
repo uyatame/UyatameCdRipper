@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -156,8 +157,14 @@ fun NowPlayingScreen(vm: MainViewModel, s: AppSettings, onClose: () -> Unit) {
                 )
             }
             CompositionLocalProvider(LocalContentColor provides content) {
+                BoxWithConstraints(Modifier.fillMaxSize().systemBarsPadding()) {
+                // 画面の小さい端末(高さが足りない・幅が狭い)では、文字やボタンを小さくし、余白を詰める
+                val compact = maxHeight < 680.dp || maxWidth < 340.dp
+                val tiny = maxHeight < 560.dp
+                val playSize = if (compact) 68.dp else 84.dp
+                val skipSize = if (compact) 52.dp else 64.dp
                 Column(
-                    Modifier.fillMaxSize().systemBarsPadding().padding(horizontal = 24.dp),
+                    Modifier.fillMaxSize().padding(horizontal = if (compact) 16.dp else 24.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -170,20 +177,24 @@ fun NowPlayingScreen(vm: MainViewModel, s: AppSettings, onClose: () -> Unit) {
                         Spacer(Modifier.weight(1f))
                         IconButton({ showSound = true }) { Icon(AppIcons.Tune, T("音響設定", "Sound"), tint = content) }
                     }
-                    Spacer(Modifier.weight(0.6f))
+                    // ジャケットは、ほかの部品を置いた残りの場所に収まる大きさにする(縦・横の短い方に合わせた正方形)
                     Box(
-                        Modifier.fillMaxWidth().widthIn(max = 460.dp).aspectRatio(1f)
-                            .shadow(24.dp, RoundedCornerShape(12.dp))
-                            .clip(RoundedCornerShape(12.dp)),
+                        Modifier.weight(1f).fillMaxWidth().padding(vertical = if (compact) 6.dp else 16.dp),
+                        contentAlignment = Alignment.Center,
                     ) {
-                        CoverBox(art, Modifier.fillMaxSize(), 12.dp)
+                        Box(
+                            Modifier.widthIn(max = 460.dp).aspectRatio(1f, matchHeightConstraintsFirst = true)
+                                .shadow(if (compact) 12.dp else 24.dp, RoundedCornerShape(12.dp))
+                                .clip(RoundedCornerShape(12.dp)),
+                        ) {
+                            CoverBox(art, Modifier.fillMaxSize(), 12.dp)
+                        }
                     }
-                    Spacer(Modifier.weight(0.5f))
                     Text(
-                        info ?: " ", style = MaterialTheme.typography.titleSmall, color = accent,
-                        fontWeight = FontWeight.Medium, maxLines = 1,
+                        info ?: " ", style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.titleSmall,
+                        color = accent, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     )
-                    Spacer(Modifier.height(6.dp))
+                    Spacer(Modifier.height(if (compact) 2.dp else 6.dp))
                     // 音響設定のクイック切り替え(タップで設定を開く)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         val chipColors = if (ambient) {
@@ -215,17 +226,20 @@ fun NowPlayingScreen(vm: MainViewModel, s: AppSettings, onClose: () -> Unit) {
                             border = if (ambient) BorderStroke(1.dp, sub) else FilterChipDefaults.filterChipBorder(enabled = true, selected = eqSel),
                         )
                     }
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(if (compact) 4.dp else 8.dp))
                     Text(
-                        cur.title, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center,
-                        maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold,
+                        cur.title, style = if (compact) MaterialTheme.typography.titleLarge else MaterialTheme.typography.headlineSmall,
+                        textAlign = TextAlign.Center, maxLines = if (compact) 1 else 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold,
                     )
-                    Spacer(Modifier.height(4.dp))
-                    Text(cur.artist, style = MaterialTheme.typography.titleMedium, color = sub, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (cur.album.isNotEmpty()) {
+                    Spacer(Modifier.height(if (compact) 2.dp else 4.dp))
+                    Text(
+                        cur.artist, style = if (compact) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.titleMedium,
+                        color = sub, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    if (cur.album.isNotEmpty() && !tiny) {
                         Text(cur.album, style = MaterialTheme.typography.bodyMedium, color = sub, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
-                    Spacer(Modifier.height(20.dp))
+                    Spacer(Modifier.height(if (compact) 8.dp else 20.dp))
 
                     var seeking by remember(cur) { mutableStateOf<Float?>(null) }
                     val dur = p.durationMs.coerceAtLeast(1)
@@ -249,7 +263,7 @@ fun NowPlayingScreen(vm: MainViewModel, s: AppSettings, onClose: () -> Unit) {
                         Spacer(Modifier.weight(1f))
                         Text(fmtMs(p.durationMs), style = MaterialTheme.typography.labelMedium, color = sub)
                     }
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(if (compact) 4.dp else 16.dp))
                     Row(
                         Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -262,24 +276,24 @@ fun NowPlayingScreen(vm: MainViewModel, s: AppSettings, onClose: () -> Unit) {
                                 tint = if (p.repeatMode != 0) accent else sub,
                             )
                         }
-                        OutlinedIconButton({ p.prev() }, Modifier.size(64.dp), border = BorderStroke(2.dp, content)) {
-                            Icon(AppIcons.SkipPrevious, T("前の曲", "Previous track"), Modifier.size(30.dp), tint = content)
+                        OutlinedIconButton({ p.prev() }, Modifier.size(skipSize), border = BorderStroke(2.dp, content)) {
+                            Icon(AppIcons.SkipPrevious, T("前の曲", "Previous track"), Modifier.size(skipSize * 0.47f), tint = content)
                         }
-                        OutlinedIconButton({ p.toggle() }, Modifier.size(84.dp), shape = CircleShape, border = BorderStroke(2.5.dp, content)) {
+                        OutlinedIconButton({ p.toggle() }, Modifier.size(playSize), shape = CircleShape, border = BorderStroke(2.5.dp, content)) {
                             Icon(
                                 if (p.isPlaying) AppIcons.Pause else Icons.Filled.PlayArrow,
                                 if (p.isPlaying) T("一時停止", "Pause") else T("再生", "Play"),
-                                Modifier.size(44.dp), tint = content,
+                                Modifier.size(playSize * 0.52f), tint = content,
                             )
                         }
-                        OutlinedIconButton({ p.next() }, Modifier.size(64.dp), border = BorderStroke(2.dp, content)) {
-                            Icon(AppIcons.SkipNext, T("次の曲", "Next track"), Modifier.size(30.dp), tint = content)
+                        OutlinedIconButton({ p.next() }, Modifier.size(skipSize), border = BorderStroke(2.dp, content)) {
+                            Icon(AppIcons.SkipNext, T("次の曲", "Next track"), Modifier.size(skipSize * 0.47f), tint = content)
                         }
                         IconButton({ p.toggleShuffle() }) {
                             Icon(AppIcons.Shuffle, T("シャッフル", "Shuffle"), tint = if (p.shuffle) accent else sub)
                         }
                     }
-                    Spacer(Modifier.weight(0.6f))
+                    Spacer(Modifier.height(if (compact) 0.dp else 12.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             T("${p.index + 1} / ${p.queue.size} 曲目", "Track ${p.index + 1} of ${p.queue.size}"),
@@ -288,7 +302,8 @@ fun NowPlayingScreen(vm: MainViewModel, s: AppSettings, onClose: () -> Unit) {
                         Spacer(Modifier.size(8.dp))
                         TextButton({ p.stop(); onClose() }) { Text(T("再生を終了", "Stop playback"), color = sub) }
                     }
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(if (compact) 2.dp else 8.dp))
+                }
                 }
             }
         }

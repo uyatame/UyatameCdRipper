@@ -93,6 +93,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val ctx: Application = app
     private val usb = app.getSystemService(Context.USB_SERVICE) as UsbManager
     private val repo = SettingsRepository(app)
+    /** 前に決めた CD の曲情報(ディスク ID ごと) */
+    private val discCache = com.uyatame.cdripper.meta.DiscCache(app)
+    /** 今入っている CD のディスク ID */
+    private var currentDiscId: String? = null
     val settings = repo.flow.stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
     val player = PlayerController(app, viewModelScope)
     private val library = Library(app)
@@ -169,6 +173,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var albums by mutableStateOf<List<LibAlbum>>(emptyList())
         private set
     var libScanning by mutableStateOf(false)
+    /** すべての曲を読み直しているか(false なら新しい曲だけ) */
+    var libFull by mutableStateOf(false)
+        private set
+    /** 今回タグを読む曲の数 */
+    var libNew by mutableIntStateOf(0)
+        private set
         private set
     var libProgress by mutableStateOf("")
         private set
@@ -414,6 +424,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun clearDisc(text: String) {
+        discOk = false
         if (player.isCd) player.stop()
         tracks = emptyList()
         meta = null
@@ -448,6 +459,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var monitorJob: Job? = null
     private var lastMedia = 0
     private var autoRetries = 0
+    /** ディスクを読み取れた(または音楽 CD 以外と分かった)か */
+    private var discOk = false
     private val mediaReady = 1
     private val mediaNone = 2
     private val mediaLoading = 3
@@ -489,7 +502,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     }
                 }
-                delay(2000)
+                // ディスクを確認できていないあいだは 0.5 秒ごとに確認し直す
+                delay(if (lastMedia == mediaReady && discOk) 1500 else 500)
             }
         }
     }
@@ -509,7 +523,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         var ready = false
         var noMedia = 0
         var lastErr = ""
-        for (i in 0 until 60) {
+        // 回転が安定するまで細かく確認する(最大 約30秒)
+        val t0 = System.currentTimeMillis()
+        while (System.currentTimeMillis() - t0 < 30_000) {
             try {
                 d.testUnitReady()
                 ready = true
@@ -517,32 +533,33 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: ScsiException) {
                 lastErr = why(e)
                 if (e.senseKey == -1) break
-                if (e.asc == 0x3A && ++noMedia >= 3) break
-                Thread.sleep(1000)
+                if (e.asc == 0x3A) { if (++noMedia >= 8) break } else noMedia = 0
+                Thread.sleep(250)
             }
         }
+        if (ready) log(T("ディスクの準備完了(%.1f 秒)", "Disc ready (%.1f s)").format((System.currentTimeMillis() - t0) / 1000.0))
         if (!ready) {
             if (noMedia >= 3) return DiscScan(T("ディスクを入れてください", "Insert a disc"), emptyList(), 0)
             log(T("ドライブ未準備: $lastErr", "Drive not ready: $lastErr"))
         }
-        val p = try { d.currentProfile() } catch (e: ScsiException) { -1 }
-        val pname = if (p < 0) T("種別不明", "Unknown type") else UsbScsiDrive.profileName(p)
-
         var toc: Pair<List<TocTrack>, Int>? = null
         var tocErr = ""
-        for (a in 0 until 8) {
+        val t1 = System.currentTimeMillis()
+        while (System.currentTimeMillis() - t1 < 12_000) {
             try {
                 toc = d.readToc()
                 break
             } catch (e: ScsiException) {
                 tocErr = why(e)
                 if (e.senseKey == -1) break
-                Thread.sleep(1500)
+                Thread.sleep(300)
             }
         }
+        // 音楽 CD なら、ディスクの種類は調べずにすぐ返す
+        if (toc != null && toc.first.any { it.isAudio }) return DiscScan("", toc.first, toc.second)
+        val p = try { d.currentProfile() } catch (e: ScsiException) { -1 }
+        val pname = if (p < 0) T("種別不明", "Unknown type") else UsbScsiDrive.profileName(p)
         if (toc != null) {
-            val (tr, lo) = toc
-            if (tr.any { it.isAudio }) return DiscScan("", tr, lo)
             if (p in 0x08..0x0A) return DiscScan(T("データCDです。音楽CDのみ再生・取り込みできます", "This is a data CD. Only audio CDs can be played or ripped"), emptyList(), 0)
         }
         var capErr = ""
@@ -566,8 +583,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val r = withContext(Dispatchers.IO) { readDisc(d) }
                 val changed = r.tracks.map { it.startLba } != tracks.map { it.startLba }
                 discText = r.text
-                // 回転が安定する前に読んで失敗した場合は、自動検知で読み直す
-                if (r.retry && autoRetries < 5) { autoRetries++; lastMedia = 0 } else if (!r.retry) autoRetries = 0
+                // 読み取れなかったときは、確認できるまで 0.5 秒ごとに読み直す
+                discOk = !r.retry && r.text != T("ディスクを入れてください", "Insert a disc")
+                if (r.retry || !discOk) lastMedia = 0
+                if (r.retry) autoRetries++ else autoRetries = 0
                 if (changed) {
                     if (player.isCd) player.stop()
                     tracks = r.tracks
@@ -582,9 +601,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     coverBytes = null
                     metaStatus = ""
                     meta = if (audioTracks.isNotEmpty()) fitMeta(AlbumMeta(UNKNOWN_ALBUM, UNKNOWN_ARTIST)) else null
+                    currentDiscId = MusicBrainz.toc(tracks, leadOut)?.discId
                     if (audioTracks.isNotEmpty()) {
                         discEvent++
-                        if (settings.value.autoMeta) fetchMeta() else metaStatus = T("曲情報は手動で編集できます", "You can edit track info manually")
+                        val id = currentDiscId
+                        val cached = id?.let { withContext(Dispatchers.IO) { discCache.load(it) } }
+                        if (cached != null && id != null) {
+                            // 前に決めた曲情報があれば、ネットに問い合わせずにすぐ使う
+                            meta = fitMeta(cached)
+                            metaStatus = "✓ " + T("曲情報: 前回の内容(選び直すこともできます)", "Track info: saved from last time (you can choose again)")
+                            val img = withContext(Dispatchers.IO) { discCache.loadCover(id) }
+                            if (img != null) {
+                                coverBytes = img
+                                cdCover = withContext(Dispatchers.IO) { ArtLoader.decode(img, 600)?.asImageBitmap() }
+                            }
+                            log(T("保存済みの曲情報を使いました", "Used saved track info"))
+                        } else if (settings.value.autoMeta) fetchMeta() else metaStatus = T("曲情報は手動で編集できます", "You can edit track info manually")
                     }
                 }
             } catch (e: Exception) {
@@ -763,6 +795,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         metaStatus = "✓ " + T("曲情報: ${sourceName(source)}", "Track info: ${sourceName(source)}")
         cdCover = null
         coverBytes = null
+        val disc = currentDiscId
+        if (disc != null) {
+            val keep = meta
+            viewModelScope.launch(Dispatchers.IO) {
+                keep?.let { discCache.save(disc, it) }
+                discCache.saveCover(disc, null)
+            }
+        }
         val id = m.releaseId ?: return
         viewModelScope.launch {
             val r = withContext(Dispatchers.IO) { MusicBrainz.cover(id) }
@@ -773,6 +813,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (meta?.releaseId != id) return@launch
             coverBytes = b
+            if (disc != null && disc == currentDiscId) withContext(Dispatchers.IO) { discCache.saveCover(disc, b) }
             cdCover = withContext(Dispatchers.IO) { ArtLoader.decode(b, 600)?.asImageBitmap() }
         }
     }
@@ -787,6 +828,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 coverBytes = b
                 cdCover = withContext(Dispatchers.IO) { ArtLoader.decode(b, 600)?.asImageBitmap() }
+                currentDiscId?.let { id -> withContext(Dispatchers.IO) { discCache.saveCover(id, b) } }
             } catch (e: Exception) {
                 snack = T("画像を読み込めませんでした", "Could not load the image")
             }
@@ -798,6 +840,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun updateMeta(m: AlbumMeta) {
         meta = fitMeta(m)
         metaStatus = T("曲情報を編集しました", "Track info edited")
+        val id = currentDiscId
+        val keep = meta
+        if (id != null && keep != null) viewModelScope.launch(Dispatchers.IO) { discCache.save(id, keep) }
     }
 
     // ================= 取り込み =================
@@ -1051,13 +1096,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (libScanning) return
         viewModelScope.launch {
             libScanning = true
+            libFull = fresh
+            libNew = 0
             try {
                 val old = if (fresh) emptyList() else albums.flatMap { it.tracks }
                 val list = withContext(Dispatchers.IO) {
                     val all = ArrayList<com.uyatame.cdripper.library.LibTrack>()
                     for (t in trees) {
                         runCatching {
-                            all.addAll(library.scan(Uri.parse(t), old) { i, n -> libProgress = "$i / $n" })
+                            all.addAll(library.scan(Uri.parse(t), old) { i, n -> libProgress = "$i / $n"; libNew = n })
                         }.onFailure { log(T("フォルダを読めません: ${folderLabel(t)}", "Cannot read folder: ${folderLabel(t)}")) }
                     }
                     all.distinctBy { it.uri }.also { library.saveCache(it) }

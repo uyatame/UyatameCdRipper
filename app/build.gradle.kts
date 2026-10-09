@@ -16,8 +16,8 @@ android {
         applicationId = "com.uyatame.cdripper"
         minSdk = 31
         targetSdk = 36
-        versionCode = 29
-        versionName = "0.3.1"
+        versionCode = 33
+        versionName = "0.3.5"
     }
 
     // 公開用の署名鍵。keystore.properties(Git には含めない)があればそれで署名し、無ければデバッグ鍵で署名する

@@ -124,14 +124,18 @@ fun LibraryScreen(vm: MainViewModel, s: AppSettings, albumKey: String?, onOpen: 
     }
     Column(Modifier.fillMaxSize()) {
         ScreenHeader(T("ライブラリ", "Library")) {
-            IconButton({ vm.refreshLibrary() }, enabled = !vm.libScanning && hasFolders) {
-                Icon(Icons.Filled.Refresh, T("ライブラリを更新", "Refresh library"))
+            // 手動の更新: すべての曲を読み直す(普段は新しく入った曲だけを自動で読み込む)
+            IconButton({ vm.refreshLibrary(fresh = true) }, enabled = !vm.libScanning && hasFolders) {
+                Icon(Icons.Filled.Refresh, T("すべての曲を読み直す", "Rescan all songs"))
             }
         }
-        if (vm.libScanning) {
+        // 新しい曲が無いときの自動確認では、何も表示しない
+        if (vm.libScanning && (vm.libFull || vm.libNew > 0 || vm.albums.isEmpty())) {
             LinearProgressIndicator(Modifier.fillMaxWidth().padding(horizontal = 16.dp))
             Text(
-                T("曲を読み込み中 ${vm.libProgress}", "Loading songs ${vm.libProgress}"), style = MaterialTheme.typography.bodySmall,
+                if (vm.libFull) T("すべての曲を読み直しています ${vm.libProgress}", "Rescanning all songs ${vm.libProgress}")
+                else T("新しい曲を読み込んでいます ${vm.libProgress}", "Loading new songs ${vm.libProgress}"),
+                style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
             )
         }
