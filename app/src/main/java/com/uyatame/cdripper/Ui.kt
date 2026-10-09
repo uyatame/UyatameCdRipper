@@ -185,7 +185,7 @@ fun App(vm: MainViewModel) {
             enter = slideInVertically { it },
             exit = slideOutVertically { it },
         ) {
-            NowPlayingScreen(vm, s.ambientPlayer) { showPlayer = false }
+            NowPlayingScreen(vm, s) { showPlayer = false }
         }
         }
     }

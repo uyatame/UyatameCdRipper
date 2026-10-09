@@ -11,6 +11,7 @@
 - **正確な読み取り**: リトライ、C2エラー検出、読み取りオフセット補正、読み取り速度の指定
 - **ライブラリ**: 取り込んだ曲と、端末内の音楽フォルダの曲をアルバム単位で表示。検索、並べ替え(アーティスト・アルバム名・最近追加・フォルダ)、グリッド/リスト表示、高速スクロール
 - **プレイヤー**: CDの直接再生、全画面プレイヤー(アンビエントモード、形式・サンプリング周波数・ビット数・ビットレート表示)、シャッフル・リピート、通知とロック画面からの操作
+- **音響**: ビットパーフェクト再生(独自の USB オーディオドライバーで USB DAC を直接駆動、UAC1/UAC2、Android 12 以降、PCM 768 kHz / 32bit)、DSD 再生(DSF / DFF、ネイティブ DSD512・DoP・PCM 変換)、10バンドイコライザー
 - **曲情報の編集**: 曲名・アーティスト・アルバム・年・ジャケットの変更、取り込み済みの曲への曲情報の後付け
 - Material Design 3、ダイナミックカラー、日本語 / English
 
@@ -72,6 +73,7 @@ UCRT turns an Android phone plus a USB optical drive into a CD ripper and player
 - Rip audio CDs to FLAC, AAC, MP3 or WAV, with retries, C2 error detection and read offset correction
 - Automatic track info and cover art from MusicBrainz, with a match chooser and name search
 - Library of ripped albums and any music folders you add, with search, sorting, grid/list views and fast scroll
+- Bit-perfect output to USB DACs (Android 14+) and a 10-band equalizer
 - Full-screen player with ambient mode and audio format details, direct CD playback, lock-screen controls
 - Tag editing for ripped and existing files
 

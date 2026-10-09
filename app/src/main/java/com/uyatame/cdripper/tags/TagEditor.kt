@@ -56,13 +56,22 @@ fun prepareCoverImage(b: ByteArray): ByteArray {
 
 /** 取り込み済みファイル(FLAC / MP3 / M4A)の曲情報を書き換える */
 object TagEditor {
-    fun supported(uri: String): Boolean = extOf(uri) in setOf("flac", "mp3", "m4a")
+    fun supported(uri: String): Boolean = extOf(uri) in setOf("flac", "mp3", "m4a", "dsf")
 
     private fun extOf(uri: String) = Uri.decode(uri).substringAfterLast('.', "").lowercase()
 
     /** 書き換えたら true、未対応形式なら false */
     fun edit(ctx: Context, uri: Uri, v: TagValues, newCover: ByteArray?): Boolean {
         val ext = extOf(uri.toString())
+        if (ext == "dsf") {
+            // DSF は大きいので、コピーせずにファイル末尾のタグだけを書き換える
+            com.uyatame.cdripper.player.dsd.DsdTags.writeDsf(
+                ctx, uri,
+                com.uyatame.cdripper.rip.Id3Tags(v.title, v.artist, v.album, v.albumArtist, v.year, v.track, v.trackTotal, v.disc, v.discTotal),
+                newCover?.let { coverFrom(it) },
+            )
+            return true
+        }
         if (ext !in setOf("flac", "mp3", "m4a")) return false
         val inF = File(ctx.cacheDir, "tag_in.$ext")
         val outF = File(ctx.cacheDir, "tag_out.$ext")

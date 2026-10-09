@@ -5,6 +5,7 @@
 | 名前 | 用途 | ライセンス |
 |---|---|---|
 | [jump3r](https://codeberg.org/sciss/jump3r) 1.0.5(LAME 3.98.4 の Java 移植) | MP3 エンコード | LGPL v2.1 以降 |
+| [JNA](https://github.com/java-native-access/jna) 5.14.0 | USB DAC 直接出力(usbfs の呼び出し) | Apache License 2.0(Apache-2.0 / LGPL-2.1 のデュアルライセンスから選択) |
 | Kotlin / kotlinx.coroutines | 言語・非同期処理 | Apache License 2.0 |
 | AndroidX(Core, Activity, Lifecycle, DataStore, DocumentFile) | Android の基盤 | Apache License 2.0 |
 | Jetpack Compose / Material 3 / Material Icons | 画面 | Apache License 2.0 |
@@ -17,4 +18,4 @@ jump3r は改変せず、独立したライブラリ(Maven: `de.sciss:jump3r:1.0
 
 ## 本アプリ独自の実装
 
-FLAC エンコーダ、MP4・ID3 タグ処理、USB 光学ドライブ制御(SCSI/MMC)、`javax.sound.sampled` 互換クラスは本アプリ独自の実装で、本アプリと同じ GPL v3 で提供します。AAC のエンコードと曲の再生には Android OS 内蔵のコーデックを使用しています。
+FLAC エンコーダ、MP4・ID3 タグ処理、USB 光学ドライブ制御(SCSI/MMC)、USB オーディオ(UAC1/UAC2)ドライバー、DSD(DSF/DSDIFF)の読み込み・DoP・PCM 変換、ID3v2 の読み取り、`javax.sound.sampled` 互換クラスは本アプリ独自の実装で、本アプリと同じ GPL v3 で提供します。AAC のエンコードと曲の再生には Android OS 内蔵のコーデックを使用しています。

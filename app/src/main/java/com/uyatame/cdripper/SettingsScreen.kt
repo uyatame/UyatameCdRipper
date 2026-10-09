@@ -59,7 +59,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import com.uyatame.cdripper.data.qualityLabel
+import com.uyatame.cdripper.player.AudioEngine
 import com.uyatame.cdripper.data.AppSettings
+import com.uyatame.cdripper.data.outputMode
 import com.uyatame.cdripper.data.AudioFormat
 import com.uyatame.cdripper.data.Keys
 import com.uyatame.cdripper.data.MP3_RATES
@@ -160,7 +162,8 @@ private fun MainSettings(vm: MainViewModel, s: AppSettings, onPage: (Int) -> Uni
             CategoryRow(
                 Icons.Filled.PlayArrow, T("表示と再生", "Display & playback"),
                 listOf(T("自動", "Auto"), T("ライト", "Light"), T("ダーク", "Dark"))[s.themeMode.coerceIn(0, 2)] +
-                    T(" ・ アンビエント ", " · Ambient ") + (if (s.ambientPlayer) "ON" else "OFF") +
+                    T(" ・ EQ ", " · EQ ") + (if (s.eqEnabled) "ON" else "OFF") +
+                    (if (s.outputMode == 2) T(" ・ ビットパーフェクト", " · Bit-perfect") else "") +
                     (if (AppLanguage.supported) " ・ " + languageLabel(AppLanguage.current(ctx)) else ""),
             ) { onPage(5) }
         }
@@ -340,6 +343,8 @@ private fun DisplayPage(vm: MainViewModel, s: AppSettings) {
         Segmented(T("テーマ", "Theme"), listOf(T("自動", "Auto"), T("ライト", "Light"), T("ダーク", "Dark")), s.themeMode) { vm.set(Keys.themeMode, it) }
         SwitchRow(T("ダイナミックカラー", "Dynamic color"), T("壁紙の色に合わせます", "Match your wallpaper colors"), s.dynamicColor) { vm.set(Keys.dynamicColor, it) }
     }
+    BitPerfectPanel(vm, s)
+    EqualizerPanel(vm, s)
     Section(T("再生画面", "Player")) {
         SwitchRow(
             T("アンビエントモード", "Ambient mode"),
@@ -428,6 +433,13 @@ private val LICENSES: List<LicenseInfo> get() = listOf(
             T("本アプリのビルド環境(プロジェクト一式)を使えば、差し替えたライブラリで再ビルドできます。", "You can rebuild the app with a replaced library using this project. ") +
             T("LGPL v2.1 の全文は本アプリに同梱しています。", "The full text of the LGPL v2.1 is included in this app."),
         "LGPL-2.1.txt",
+    ),
+    LicenseInfo(
+        "JNA (Java Native Access)", "5.14.0", "Copyright (c) 2007-2024 Timothy Wall and JNA contributors",
+        T("Apache License 2.0(Apache-2.0 / LGPL-2.1 のデュアルライセンスから Apache-2.0 を選択)", "Apache License 2.0 (chosen from the Apache-2.0 / LGPL-2.1 dual license)"),
+        APACHE, "https://github.com/java-native-access/jna",
+        T("USB DAC 直接出力で、USB の等時転送を行うために利用しています。", "Used for USB isochronous transfers in USB DAC direct output."),
+        "Apache-2.0.txt",
     ),
     LicenseInfo(
         T("Kotlin 標準ライブラリ", "Kotlin standard library"), "2.1.0", "Copyright JetBrains s.r.o. and Kotlin Programming Language contributors",

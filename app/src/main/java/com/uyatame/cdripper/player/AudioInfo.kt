@@ -10,6 +10,11 @@ object AudioInfo {
     fun describe(ctx: Context, item: PlayItem): String? {
         if (item.cdTrack != null) return "CD-DA 44.1 kHz / 16 bit · 1411 kbps"
         val uri = item.uri ?: return null
+        if (com.uyatame.cdripper.player.dsd.DsdFile.isDsd(Uri.decode(uri.toString()))) {
+            val d = com.uyatame.cdripper.player.dsd.DsdTags.read(ctx, uri)?.info ?: return "DSD"
+            val kbps = d.rate.toLong() * d.channels / 1000
+            return d.label() + " · " + (if (d.dff) "DFF" else "DSF") + " · $kbps kbps"
+        }
         val r = MediaMetadataRetriever()
         try {
             r.setDataSource(ctx, uri)
@@ -40,6 +45,13 @@ object AudioInfo {
         } finally {
             runCatching { r.release() }
         }
+    }
+
+    /** 音源のビット数(FLAC / WAV はファイルの中身から読む。分からなければ 16) */
+    fun bitsOf(ctx: Context, uri: Uri): Int {
+        val ext = Uri.decode(uri.toString()).substringAfterLast('.', "").lowercase()
+        val name = when (ext) { "flac" -> "FLAC"; "wav" -> "WAV"; else -> return 16 }
+        return header(ctx, uri, name)?.second?.takeIf { it in 8..32 } ?: 16
     }
 
     private fun formatName(mime: String, ext: String): String = when {

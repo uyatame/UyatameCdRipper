@@ -39,7 +39,7 @@ data class LibAlbum(val key: String, val title: String, val artist: String, val 
 val UNKNOWN_ALBUM: String get() = T("不明なアルバム", "Unknown album")
 val UNKNOWN_ARTIST: String get() = T("不明なアーティスト", "Unknown artist")
 
-private val AUDIO_EXT = setOf("flac", "wav", "m4a", "mp3", "ogg", "opus", "aac")
+private val AUDIO_EXT = setOf("flac", "wav", "m4a", "mp3", "ogg", "opus", "aac", "dsf", "dff")
 private val COVER_NAMES = setOf("cover.jpg", "cover.png", "folder.jpg", "front.jpg")
 
 /** 保存先フォルダ内の音楽ファイルを読み取り、アルバム単位にまとめる */
@@ -131,7 +131,27 @@ class Library(private val ctx: Context) {
         if (depth < 8) for (d in dirs) walk(tree, d, depth + 1, found, names, covers)
     }
 
+    /** DSD(DSF / DFF)は Android 標準の機能で読めないので、自前で読む */
+    private fun readDsdTags(uri: Uri, name: String, folder: String, cover: String?, mod: Long): LibTrack {
+        val base = name.substringBeforeLast('.')
+        val r = com.uyatame.cdripper.player.dsd.DsdTags.read(ctx, uri)
+        val t = r?.tags
+        return LibTrack(
+            uri.toString(),
+            t?.title ?: base,
+            t?.artist ?: UNKNOWN_ARTIST,
+            t?.album ?: UNKNOWN_ALBUM,
+            t?.albumArtist ?: "",
+            t?.track ?: base.take(2).toIntOrNull() ?: 0,
+            t?.disc ?: 1,
+            r?.info?.durationMs ?: 0L,
+            folder, cover, mod,
+            t?.year ?: "",
+        )
+    }
+
     private fun readTags(uri: Uri, name: String, folder: String, cover: String?, mod: Long): LibTrack {
+        if (com.uyatame.cdripper.player.dsd.DsdFile.isDsd(name)) return readDsdTags(uri, name, folder, cover, mod)
         val base = name.substringBeforeLast('.')
         val r = MediaMetadataRetriever()
         return try {
@@ -189,7 +209,9 @@ object ArtLoader {
         cache.get(key)?.let { return it }
         synchronized(misses) { if (key in misses) return null }
         var bytes: ByteArray? = null
-        if (trackUri != null) {
+        if (trackUri != null && com.uyatame.cdripper.player.dsd.DsdFile.isDsd(Uri.decode(trackUri))) {
+            bytes = runCatching { com.uyatame.cdripper.player.dsd.DsdTags.picture(ctx, Uri.parse(trackUri)) }.getOrNull()
+        } else if (trackUri != null) {
             val r = MediaMetadataRetriever()
             try {
                 r.setDataSource(ctx, Uri.parse(trackUri))

@@ -63,6 +63,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import com.uyatame.cdripper.library.ArtLoader
+import com.uyatame.cdripper.data.AppSettings
+import com.uyatame.cdripper.data.outputMode
+import com.uyatame.cdripper.player.AudioEngine
+import com.uyatame.cdripper.player.EqBands
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import com.uyatame.cdripper.player.AudioInfo
 import com.uyatame.cdripper.player.PlayItem
 import kotlinx.coroutines.Dispatchers
@@ -90,7 +96,10 @@ private fun rememberArt(vm: MainViewModel, item: PlayItem): ImageBitmap? {
  * 画面全体をジャケットの色合いに染める。
  */
 @Composable
-fun NowPlayingScreen(vm: MainViewModel, ambient: Boolean, onClose: () -> Unit) {
+fun NowPlayingScreen(vm: MainViewModel, s: AppSettings, onClose: () -> Unit) {
+    val ambient = s.ambientPlayer
+    var showSound by remember { mutableStateOf(false) }
+    if (showSound) AudioSettingsSheet(vm, s) { showSound = false }
     val p = vm.player
     val cur = p.current ?: return
     val ctx = LocalContext.current
@@ -159,7 +168,7 @@ fun NowPlayingScreen(vm: MainViewModel, ambient: Boolean, onClose: () -> Unit) {
                             style = MaterialTheme.typography.labelLarge, color = sub,
                         )
                         Spacer(Modifier.weight(1f))
-                        Spacer(Modifier.size(48.dp))
+                        IconButton({ showSound = true }) { Icon(AppIcons.Tune, T("音響設定", "Sound"), tint = content) }
                     }
                     Spacer(Modifier.weight(0.6f))
                     Box(
@@ -174,6 +183,38 @@ fun NowPlayingScreen(vm: MainViewModel, ambient: Boolean, onClose: () -> Unit) {
                         info ?: " ", style = MaterialTheme.typography.titleSmall, color = accent,
                         fontWeight = FontWeight.Medium, maxLines = 1,
                     )
+                    Spacer(Modifier.height(6.dp))
+                    // 音響設定のクイック切り替え(タップで設定を開く)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        val chipColors = if (ambient) {
+                            FilterChipDefaults.filterChipColors(
+                                labelColor = sub, selectedLabelColor = Color.Black,
+                                selectedContainerColor = accent,
+                            )
+                        } else FilterChipDefaults.filterChipColors()
+                        val mode = s.outputMode
+                        val bpSel = mode != 0
+                        val eqSel = s.eqEnabled && !(mode != 0 && AudioEngine.bitPerfectActive)
+                        FilterChip(
+                            selected = bpSel,
+                            onClick = { showSound = true },
+                            label = {
+                                Text(if (mode != 0 && AudioEngine.bitPerfectActive) "Bit-perfect ✓" else "Bit-perfect")
+                            },
+                            colors = chipColors,
+                            border = if (ambient) BorderStroke(1.dp, sub) else FilterChipDefaults.filterChipBorder(enabled = true, selected = bpSel),
+                        )
+                        FilterChip(
+                            selected = eqSel,
+                            onClick = { showSound = true },
+                            label = {
+                                val name = EqBands.PRESETS.getOrNull(s.eqPreset)?.let { T(it.ja, it.en) } ?: T("カスタム", "Custom")
+                                Text("EQ" + if (s.eqEnabled) " · $name" else " OFF")
+                            },
+                            colors = chipColors,
+                            border = if (ambient) BorderStroke(1.dp, sub) else FilterChipDefaults.filterChipBorder(enabled = true, selected = eqSel),
+                        )
+                    }
                     Spacer(Modifier.height(8.dp))
                     Text(
                         cur.title, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center,

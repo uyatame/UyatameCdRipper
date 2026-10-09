@@ -45,4 +45,5 @@ object AppIcons {
     val RepeatOne = icon("RepeatOne", "M7,7h10v3l4,-4l-4,-4v3H5v6h2V7zM17,17H7v-3l-4,4l4,4v-3h12v-6h-2v4zM13,15V9h-1l-2,1v1h1.5v4H13z")
     val Grid = icon("Grid", "M3,3h8v8H3zM13,3h8v8h-8zM3,13h8v8H3zM13,13h8v8h-8z")
     val ListView = icon("ListView", "M3,5h4v4H3zM9,6h12v2H9zM3,10h4v4H3zM9,11h12v2H9zM3,15h4v4H3zM9,16h12v2H9z")
+    val Tune = icon("Tune", "M3,17v2h6v-2H3zM3,5v2h10V5H3zM13,21v-2h8v-2h-8v-2h-2v6h2zM7,9v2H3v2h4v2h2V9H7zM21,13v-2H11v2h10zM15,9h2V7h4V5h-4V3h-2v6z")
 }

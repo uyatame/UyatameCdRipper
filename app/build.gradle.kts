@@ -16,8 +16,8 @@ android {
         applicationId = "com.uyatame.cdripper"
         minSdk = 31
         targetSdk = 36
-        versionCode = 25
-        versionName = "0.2.0"
+        versionCode = 29
+        versionName = "0.3.1"
     }
 
     // 公開用の署名鍵。keystore.properties(Git には含めない)があればそれで署名し、無ければデバッグ鍵で署名する
@@ -67,6 +67,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     // MP3エンコーダ: jump3r(LAME 3.98.4 Java移植版) LGPL v2.1+
     implementation("de.sciss:jump3r:1.0.5")
+    // USB DAC 直接出力: usbfs の ioctl を呼ぶために使う JNA(Apache-2.0 / LGPL-2.1 のデュアルライセンス。Apache-2.0 を選択)
+    implementation("net.java.dev.jna:jna:5.14.0@aar")
 }
 
 // ---------------------------------------------------------------

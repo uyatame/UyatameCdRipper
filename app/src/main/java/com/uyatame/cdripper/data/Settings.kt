@@ -70,9 +70,23 @@ data class AppSettings(
     val themeMode: Int = 0,
     val dynamicColor: Boolean = true,
     val ambientPlayer: Boolean = true,
+    val bitPerfect: Boolean = false,
+    val usbDirect: Boolean = false,
+    /** -1 = 自動(USB から音量を変えられる DAC は 50、変えられない DAC は 100) */
+    val usbVolume: Int = -1,
+    val dsdMode: Int = 0,
+    val dsdSwap: Boolean = false,
+    val eqEnabled: Boolean = false,
+    val eqPreset: Int = 0,
+    val eqGains: String = "",
+    val eqPreamp: Float = 0f,
+    val eqAutoPreamp: Boolean = true,
     val libraryList: Boolean = false,
     val verboseLog: Boolean = false,
 )
+
+/** 出力方式: 0 = 通常, 2 = ビットパーフェクト(USB DAC 直接出力)。以前の版の bitPerfect もこちらに移す */
+val AppSettings.outputMode: Int get() = if (usbDirect || bitPerfect) 2 else 0
 
 fun AppSettings.presetIndex(): Int = QUALITY_PRESETS.indexOfFirst { p ->
     p.format == format && when (format) {
@@ -118,6 +132,16 @@ object Keys {
     val themeMode = intPreferencesKey("themeMode")
     val dynamicColor = booleanPreferencesKey("dynamicColor")
     val ambientPlayer = booleanPreferencesKey("ambientPlayer")
+    val bitPerfect = booleanPreferencesKey("bitPerfect")
+    val usbDirect = booleanPreferencesKey("usbDirect")
+    val usbVolume = intPreferencesKey("usbVolume")
+    val dsdMode = intPreferencesKey("dsdMode")
+    val dsdSwap = booleanPreferencesKey("dsdSwap")
+    val eqEnabled = booleanPreferencesKey("eqEnabled")
+    val eqPreset = intPreferencesKey("eqPreset")
+    val eqGains = stringPreferencesKey("eqGains")
+    val eqPreamp = androidx.datastore.preferences.core.floatPreferencesKey("eqPreamp")
+    val eqAutoPreamp = booleanPreferencesKey("eqAutoPreamp")
     val libraryList = booleanPreferencesKey("libraryList")
     val verboseLog = booleanPreferencesKey("verboseLog")
 }
@@ -153,6 +177,16 @@ class SettingsRepository(private val context: Context) {
             themeMode = p[Keys.themeMode] ?: d.themeMode,
             dynamicColor = p[Keys.dynamicColor] ?: d.dynamicColor,
             ambientPlayer = p[Keys.ambientPlayer] ?: d.ambientPlayer,
+            bitPerfect = p[Keys.bitPerfect] ?: d.bitPerfect,
+            usbDirect = p[Keys.usbDirect] ?: d.usbDirect,
+            usbVolume = p[Keys.usbVolume] ?: d.usbVolume,
+            dsdMode = p[Keys.dsdMode] ?: d.dsdMode,
+            dsdSwap = p[Keys.dsdSwap] ?: d.dsdSwap,
+            eqEnabled = p[Keys.eqEnabled] ?: d.eqEnabled,
+            eqPreset = p[Keys.eqPreset] ?: d.eqPreset,
+            eqGains = p[Keys.eqGains] ?: d.eqGains,
+            eqPreamp = p[Keys.eqPreamp] ?: d.eqPreamp,
+            eqAutoPreamp = p[Keys.eqAutoPreamp] ?: d.eqAutoPreamp,
             libraryList = p[Keys.libraryList] ?: d.libraryList,
             verboseLog = p[Keys.verboseLog] ?: d.verboseLog,
         )

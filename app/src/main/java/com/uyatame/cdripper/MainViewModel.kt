@@ -31,6 +31,7 @@ import com.uyatame.cdripper.data.AudioFormat
 import com.uyatame.cdripper.data.Keys
 import com.uyatame.cdripper.data.QualityPreset
 import com.uyatame.cdripper.data.SettingsRepository
+import com.uyatame.cdripper.data.outputMode
 import com.uyatame.cdripper.tags.TagEditor
 import com.uyatame.cdripper.tags.TagValues
 import com.uyatame.cdripper.tags.prepareCoverImage
@@ -200,6 +201,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
     private val detachReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
+            // 外れたのが USB DAC など(大容量記憶装置クラスでない機器)なら、ドライブには関係ない
+            val dev = androidx.core.content.IntentCompat.getParcelableExtra(i, UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+            if (dev != null && (0 until dev.interfaceCount).none { dev.getInterface(it).interfaceClass == 8 }) return
             if (drive != null) closeDrive(T("ドライブが取り外されました", "The drive was disconnected"))
         }
     }
@@ -210,6 +214,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             app, detachReceiver, IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED), ContextCompat.RECEIVER_NOT_EXPORTED,
         )
         MediaBridge.player = player
+        // 再生エンジンの診断メッセージをアプリのログに出す
+        com.uyatame.cdripper.player.AudioEngine.logger = { msg -> log(msg) }
+        // 音量キーで DAC の音量を変えたら保存する
+        com.uyatame.cdripper.player.AudioEngine.onUsbVolume = { v -> set(com.uyatame.cdripper.data.Keys.usbVolume, v) }
+        // 保存されている音響設定を再生エンジンに反映し続ける
+        viewModelScope.launch {
+            var lastMode: Int? = null
+            settings.collect { s ->
+                com.uyatame.cdripper.player.AudioEngine.setEq(
+                    s.eqEnabled, com.uyatame.cdripper.player.EqBands.decode(s.eqGains), s.eqPreamp, s.eqAutoPreamp,
+                )
+                val mode = s.outputMode
+                com.uyatame.cdripper.player.AudioEngine.setOutputMode(mode)
+                player.setUsbVolume(s.usbVolume)
+                val dsdChanged = com.uyatame.cdripper.player.AudioEngine.dsdMode != s.dsdMode ||
+                    com.uyatame.cdripper.player.AudioEngine.dsdSwap != s.dsdSwap
+                com.uyatame.cdripper.player.AudioEngine.dsdMode = s.dsdMode
+                com.uyatame.cdripper.player.AudioEngine.dsdSwap = s.dsdSwap
+                if (lastMode != null && (lastMode != mode || (dsdChanged && player.isDsd))) player.reloadOutput()
+                lastMode = mode
+            }
+        }
         // 以前の版で保存した連絡先メールアドレスは不要になったので消す
         viewModelScope.launch { repo.set(com.uyatame.cdripper.data.Keys.contactEmail, "") }
         player.onStateChanged = {
@@ -224,6 +250,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        com.uyatame.cdripper.player.AudioEngine.logger = null
+        com.uyatame.cdripper.player.AudioEngine.onUsbVolume = null
         runCatching { ctx.unregisterReceiver(permReceiver) }
         runCatching { ctx.unregisterReceiver(detachReceiver) }
         player.release()
@@ -238,6 +266,38 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun <T> set(key: Preferences.Key<T>, v: T) {
         viewModelScope.launch { repo.set(key, v) }
+    }
+
+    /** イコライザーの帯域を動かしている途中(保存はせず、音だけすぐ変える) */
+    fun previewEq(gains: FloatArray, preamp: Float) {
+        val s = settings.value
+        com.uyatame.cdripper.player.AudioEngine.setEq(s.eqEnabled, gains, preamp, s.eqAutoPreamp)
+    }
+
+    /** ビットパーフェクト(USB DAC 直接出力)の切り替え */
+    fun setOutputMode(mode: Int) {
+        viewModelScope.launch {
+            if (mode == 2) {
+                repo.set(com.uyatame.cdripper.data.Keys.usbDirect, true)
+            } else {
+                repo.set(com.uyatame.cdripper.data.Keys.bitPerfect, false)
+                repo.set(com.uyatame.cdripper.data.Keys.usbDirect, false)
+            }
+        }
+    }
+
+    /** DAC の音量(画面のスライダーから) */
+    fun setUsbVolume(v: Int, save: Boolean) {
+        player.setUsbVolume(v)
+        if (save) set(com.uyatame.cdripper.data.Keys.usbVolume, v)
+    }
+
+    fun saveEq(gains: FloatArray, preamp: Float, preset: Int) {
+        viewModelScope.launch {
+            repo.set(Keys.eqGains, com.uyatame.cdripper.player.EqBands.encode(gains))
+            repo.set(Keys.eqPreamp, preamp)
+            repo.set(Keys.eqPreset, preset)
+        }
     }
 
     fun setPreset(p: QualityPreset) {
